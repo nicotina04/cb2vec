@@ -8,6 +8,7 @@ Exact categorical codebook embeddings and reversible token deltas for Rust searc
   <a href="https://crates.io/crates/cb2vec"><img alt="crates.io" src="https://img.shields.io/crates/v/cb2vec.svg"></a>
   <a href="https://crates.io/crates/cb2vec"><img alt="license" src="https://img.shields.io/crates/l/cb2vec.svg"></a>
   <a href="https://docs.rs/cb2vec"><img alt="docs.rs" src="https://docs.rs/cb2vec/badge.svg"></a>
+  <a href="https://github.com/nicotina04/cb2vec/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/nicotina04/cb2vec/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
 ## What is CB2Vec?
@@ -81,6 +82,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The checked free functions reject an out-of-range token or incorrectly sized
 output buffer. Validated search hot paths can call the statically dispatched
 `QuantizedCodebookAccess` methods directly.
+
+## Features and MSRV
+
+| Feature | Default | Purpose |
+|---|---:|---|
+| `json` | yes | Parse canonical CB2Vec and supported legacy JSON model files through `serde_json`. |
+
+Consumers that load only binary artifacts can avoid the JSON dependency:
+
+```toml
+[dependencies]
+cb2vec = { version = "0.1", default-features = false }
+```
+
+CB2Vec 0.1 requires Rust 1.88 or newer.
 
 ## Attaching a policy
 
@@ -211,6 +227,11 @@ Those are FIGRID integration results, not universal speed claims for every
 CB2Vec consumer. Workload-level performance still depends on token locality,
 embedding dimension, group layout, and search behavior.
 
+The standalone `v0.1.0` root preserves the exact `crates/cb2vec` tree from
+FIGRID commit `54d5807`. Version 0.1.1 changes repository metadata,
+documentation, tests, and continuous integration only; its runtime
+implementation and artifact format are unchanged.
+
 ## Relationship to NORU
 
 [NORU](https://crates.io/crates/noru) and CB2Vec are sibling Rust primitives:
@@ -226,15 +247,16 @@ legacy NNUE lineage and CB2Vec for the promoted codebook evaluator.
 
 ```sh
 cargo fmt --all --check
-cargo test -p cb2vec --all-features
-cargo clippy -p cb2vec --all-targets --all-features -- -D warnings
-cargo doc -p cb2vec --all-features --no-deps
-cargo package -p cb2vec --locked
+cargo test --locked --all-features
+cargo test --locked --no-default-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo doc --locked --all-features --no-deps
+cargo package --locked
 ```
 
-The repository keeps FIGRID integration tests beside the game adapter, while
-generic model, journal, factored-storage, and artifact tests live in this
-crate.
+Generic model, journal, factored-storage, and artifact tests live in this
+crate. Game-level integration tests remain in
+[figrid-board](https://github.com/nicotina04/figrid-board) beside its adapter.
 
 ## License
 

@@ -220,6 +220,7 @@ impl CodebookWeights {
     }
 
     #[cfg(feature = "json")]
+    /// Parses a canonical CB2Vec or supported legacy JSON model.
     pub fn from_json_bytes(data: &[u8]) -> Result<Self, ModelError> {
         let root: Value = serde_json::from_slice(data)
             .map_err(|error| ModelError::InvalidJson(error.to_string()))?;
@@ -227,6 +228,7 @@ impl CodebookWeights {
     }
 
     #[cfg(feature = "json")]
+    /// Builds a model from a previously parsed JSON value.
     pub fn from_json_value(root: &Value) -> Result<Self, ModelError> {
         let format = json_str(root, "format")?;
         if format != "cb2vec-model-v1"
@@ -998,6 +1000,80 @@ mod tests {
             ModelShape::new(17, 3, 8, 2).unwrap()
         );
         assert_eq!(weights.feature_len(), 24);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn canonical_json_model_parses() {
+        let model = CodebookWeights::from_json_bytes(
+            br#"{
+                "format": "cb2vec-model-v1",
+                "model": "codebook-group-fm",
+                "metadata": {"embedding_dim": 2, "fm_rank": 1},
+                "weights": {
+                    "embeddings": [0.0, 1.0, 2.0, 3.0],
+                    "head": [0.1, 0.2, 0.3, 0.4],
+                    "factors": [0.5, 0.6, 0.7, 0.8],
+                    "bias": 0.25
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.validate().unwrap(),
+            ModelShape::new(2, 2, 2, 1).unwrap()
+        );
+        assert_eq!(model.bias, 0.25);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn legacy_json_alias_parses() {
+        let model = CodebookWeights::from_json_bytes(
+            br#"{
+                "format": "noru-relation-fusion-eval-v1",
+                "model": "region-codebook-fm",
+                "embedding_dim": 2,
+                "fm_rank": 0,
+                "weights": {
+                    "embeddings": [0.0, 1.0],
+                    "head": [0.1, 0.2],
+                    "factors": [],
+                    "bias": 0.0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.validate().unwrap(),
+            ModelShape::new(1, 1, 2, 0).unwrap()
+        );
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn malformed_and_unknown_json_fail_closed() {
+        assert!(matches!(
+            CodebookWeights::from_json_bytes(br#"{"format":"cb2vec-model-v1""#),
+            Err(ModelError::InvalidJson(_))
+        ));
+        assert!(matches!(
+            CodebookWeights::from_json_bytes(
+                br#"{
+                    "format": "unknown-model-v9",
+                    "embedding_dim": 1,
+                    "weights": {
+                        "embeddings": [0.0],
+                        "head": [0.0],
+                        "factors": [],
+                        "bias": 0.0
+                    }
+                }"#,
+            ),
+            Err(ModelError::InvalidJson(_))
+        ));
     }
 
     #[test]
