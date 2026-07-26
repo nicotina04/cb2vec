@@ -196,7 +196,7 @@ The flattened batch format concatenates all samples' tokens and sites. It has
 one global token-offset prefix table and a second prefix table delimiting the
 sites owned by each sample. No per-sample pointer graph crosses P/Invoke.
 
-The three version numbers are deliberately independent: crate `0.2.1`,
+The three version numbers are deliberately independent: crate `0.2.2`,
 artifact format `1`, and C ABI `1.0` (`0x00010000`). Artifact v1 does not store
 activation/pooling, so native model loading also takes an explicit
 `Cb2VecInferenceConfigV1`.

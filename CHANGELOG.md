@@ -2,6 +2,20 @@
 
 All notable changes to CB2Vec are documented in this file.
 
+## 0.2.2 - 2026-07-27
+
+- Lead with the domain-independent workload: mutable categorical state with
+  small local changes, repeated evaluation, and exact undo.
+- Add a practical selection guide covering suitable non-game workloads,
+  cases where NORU or a conventional dense model is a better fit, and the
+  boundary between representation choice and universal speed claims.
+- Add `BENCHMARKS.md` with a scoped same-engine Gomoku evaluator case study,
+  exact incremental-update evidence, correctness requirements, and a template
+  for benchmarking new consumers.
+- Include the benchmark guide in the published crate package.
+- No Rust API, C ABI, artifact format, training, quantization, or inference
+  behavior changed.
+
 ## 0.2.1 - 2026-07-26
 
 - Build the same crate as both a Rust `rlib` and native `cdylib`, producing
