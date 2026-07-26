@@ -5,6 +5,10 @@ Train, quantize, and incrementally deploy categorical value models in pure Rust.
 </p>
 
 <p align="center">
+Change one token. Update one embedding. Undo exactly.
+</p>
+
+<p align="center">
   <a href="https://crates.io/crates/cb2vec"><img alt="crates.io" src="https://img.shields.io/crates/v/cb2vec.svg"></a>
   <a href="https://crates.io/crates/cb2vec"><img alt="license" src="https://img.shields.io/crates/l/cb2vec.svg"></a>
   <a href="https://docs.rs/cb2vec"><img alt="docs.rs" src="https://docs.rs/cb2vec/badge.svg"></a>
@@ -13,8 +17,8 @@ Train, quantize, and incrementally deploy categorical value models in pure Rust.
 
 ## What is CB2Vec?
 
-CB2Vec is a compact, game-independent categorical value-model toolkit
-extracted from FIGRID's deployed codebook evaluator. It provides:
+CB2Vec is a compact, domain-independent categorical value-model toolkit for
+mutable discrete state. It provides:
 
 - deterministic FP32 training with Adam, BCE-with-logits, and MSE;
 - site activation and grouped sum/mean pooling;
@@ -57,6 +61,35 @@ domain state at runtime
 
 The domain adapter remains responsible for token production and perspective
 mapping. The core never imports a board, move, ruleset, or search type.
+
+## Is CB2Vec a fit?
+
+CB2Vec is a strong candidate when most of these are true:
+
+- state has fixed or bounded sites, entities, slots, or variables;
+- observations at those sites are categorical rather than dense continuous
+  vectors;
+- one action changes only a small number of tokens;
+- search repeatedly branches, evaluates, and undoes state;
+- shared token meaning across sites is useful;
+- CPU latency, predictable allocation, or native deployment matters.
+
+Examples include backtracking and branch-and-bound search, scheduling and
+constraint solvers, graph coloring, dependency resolution, compiler search,
+circuit placement, planning, and game AI.
+
+Prefer [NORU](https://github.com/nicotina04/noru) when the representation is
+naturally a sparse global feature set feeding an NNUE accumulator and dense
+MLP. Prefer a conventional dense or batched model when most state changes
+globally, inference is one-shot, inputs are primarily continuous, or GPU
+throughput matters more than make/undo latency.
+
+The distinction is architectural, not a universal performance ranking. A
+same-engine Gomoku case study
+([FIGRID](https://github.com/nicotina04/figrid-board)) measured a much smaller
+codebook evaluator and higher search throughput than its earlier flat NNUE,
+but that result depends on the domain, feature vocabulary, model shape, and
+search workload. See [Benchmark methodology and evidence](BENCHMARKS.md).
 
 ## Quick start
 
@@ -458,8 +491,9 @@ handle without freezing game-specific state into ABI 1.0.
 
 ## Evidence and provenance
 
-The code was extracted from the FIGRID 0.8.3 evaluator after the following
-integration gates:
+The runtime originated in a deployed Gomoku engine
+([FIGRID](https://github.com/nicotina04/figrid-board)) and was extracted after
+the following integration gates:
 
 - exact mixed make/undo comparison against full rebuild over 100,000
   transitions;
@@ -491,8 +525,10 @@ NORU when your representation is naturally a sparse global feature set; use
 CB2Vec when multiple local categorical observations should share learned
 embedding rows before grouped pooling.
 
-[figrid-board](https://crates.io/crates/figrid-board) uses NORU for its
-legacy NNUE lineage and CB2Vec for the promoted codebook evaluator.
+A Gomoku engine
+([FIGRID](https://github.com/nicotina04/figrid-board)) uses NORU for its NNUE
+lineage and learned ordering model, and CB2Vec for its promoted codebook leaf
+evaluator. It is one validation case, not the definition of CB2Vec's scope.
 
 ## Development
 

@@ -22,6 +22,7 @@ include = [
     "/bindings/csharp/smoke/*.csproj",
     "/Cargo.toml",
     "/README.md",
+    "/BENCHMARKS.md",
     "/CHANGELOG.md",
     "/LICENSE-*",
 ]
