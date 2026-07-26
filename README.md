@@ -1,7 +1,7 @@
 <h1 align="center">CB2Vec</h1>
 
 <p align="center">
-Exact categorical codebook embeddings and reversible token deltas for Rust search engines.
+Train, quantize, and incrementally deploy categorical value models in pure Rust.
 </p>
 
 <p align="center">
@@ -13,20 +13,23 @@ Exact categorical codebook embeddings and reversible token deltas for Rust searc
 
 ## What is CB2Vec?
 
-CB2Vec is the game-independent runtime extracted from FIGRID's categorical
-codebook evaluator. It provides:
+CB2Vec is a compact, game-independent categorical value-model toolkit
+extracted from FIGRID's deployed codebook evaluator. It provides:
 
+- deterministic FP32 training with Adam, BCE-with-logits, and MSE;
+- site activation and grouped sum/mean pooling;
 - floating-point and `i16` codebook model representations;
+- post-training quantization and a versioned binary artifact;
 - exact integer embedding lookup and replacement deltas;
 - grouped linear and factorization-machine scoring;
 - exact class-base plus `i8` residual storage;
-- a versioned, fail-closed binary artifact;
 - a preallocated reversible token journal for make/undo search.
 
-CB2Vec is not Word2Vec, a tokenizer, a vocabulary learner, or a training
-framework. A consuming application decides what its integer tokens mean,
-which sites changed, how sites map to groups, and how legal actions and
-search are implemented.
+CB2Vec is not Word2Vec and does not invent a vocabulary or tokenize a domain
+for you. A consuming application decides what its integer tokens mean, how
+sites map to groups, and what the supervised targets mean. Once those tokens
+and targets exist, CB2Vec owns the reusable numerical path from FP32 training
+through quantized deployment.
 
 ## Why this crate?
 
@@ -34,13 +37,19 @@ Codebook evaluators are often written directly inside one game engine. That
 makes the useful runtime machinery difficult to reuse and easy to couple to a
 specific board size, vocabulary, or color convention.
 
-CB2Vec separates the reusable numerical core:
+CB2Vec separates the reusable numerical core and keeps domain rules outside:
 
 ```text
-domain state
+tokenized training samples
+  -> deterministic FP32 Trainer + Adam
+  -> post-training i16 quantization
+  -> versioned artifact
+  -> deployment runtime
+
+domain state at runtime
   -> categorical tokens at (site, lane)
   -> shared embedding rows
-  -> consumer-defined activation and grouped pooling
+  -> activation and grouped pooling
   -> linear or factorization-machine head
 ```
 
@@ -53,35 +62,52 @@ Add CB2Vec to `Cargo.toml`:
 
 ```toml
 [dependencies]
-cb2vec = "0.1"
+cb2vec = "0.2"
 ```
 
-Create and quantize a small model, then replace one token exactly:
+Train a two-token value model, quantize it, and pack a deployment artifact:
 
 ```rust
 use cb2vec::{
-    CodebookWeights, add_embedding_delta_to, add_embedding_to,
+    Activation, GroupedTokens, Loss, ModelShape, PackedCodebookArtifact,
+    Pooling, Trainer, TrainerConfig, TrainingSample, predict_quantized,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 16 tokens, 3 pooled groups, 8 embedding components, FM rank 2.
-    let source = CodebookWeights::deterministic(16, 3, 8, 2);
-    let model = source.quantize_i16_s32_s64();
+    let state = |token| GroupedTokens::new(vec![token], vec![0, 1], vec![0]);
+    let samples = vec![
+        TrainingSample::new(state(0)?, 0.0),
+        TrainingSample::new(state(1)?, 1.0),
+    ];
+    let mut trainer = Trainer::from_shape(
+        ModelShape::new(2, 1, 8, 2)?,
+        TrainerConfig {
+            activation: Activation::Relu,
+            pooling: Pooling::Sum,
+            loss: Loss::BinaryCrossEntropyWithLogits,
+            batch_size: 2,
+            ..TrainerConfig::default()
+        },
+    )?;
+    trainer.train_epochs(&samples, 100)?;
 
-    let mut site = vec![0i32; model.dim];
-    add_embedding_to(&model, 2, &mut site)?;
-    add_embedding_delta_to(&model, 2, 7, &mut site)?;
-
-    let mut expected = vec![0i32; model.dim];
-    add_embedding_to(&model, 7, &mut expected)?;
-    assert_eq!(site, expected);
+    let (source, inference) = trainer.into_parts();
+    let quantized = source.quantize_i16_s32_s64();
+    let _deployment_score = predict_quantized(&samples[0].input, &quantized, inference)?;
+    let artifact = PackedCodebookArtifact::new_flat(source, quantized, [0; 32])?;
+    let bytes = artifact.to_bytes()?;
+    assert!(!bytes.is_empty());
     Ok(())
 }
 ```
 
-The checked free functions reject an out-of-range token or incorrectly sized
-output buffer. Validated search hot paths can call the statically dispatched
-`QuantizedCodebookAccess` methods directly.
+See [`examples/train_value.rs`](examples/train_value.rs) for a complete
+end-to-end example with loss reporting and predictions.
+
+The v1 artifact stores model weights and quantization metadata, but not
+`InferenceConfig`. Persist the activation/pooling recipe beside the artifact
+or provide it in the deployment adapter. `Trainer::into_parts` makes that
+boundary explicit.
 
 ## Features and MSRV
 
@@ -93,10 +119,57 @@ Consumers that load only binary artifacts can avoid the JSON dependency:
 
 ```toml
 [dependencies]
-cb2vec = { version = "0.1", default-features = false }
+cb2vec = { version = "0.2", default-features = false }
 ```
 
-CB2Vec 0.1 requires Rust 1.88 or newer.
+CB2Vec 0.2 requires Rust 1.88 or newer. Training and binary artifacts do not
+require an optional feature.
+
+## Training model
+
+`GroupedTokens` preserves site boundaries in a flat allocation-friendly
+layout:
+
+```text
+tokens:       [t0, t1, t2, ...]
+site_offsets: [0,     2,  3, ...]
+site_groups:  [g0,    g1, ...]
+```
+
+For each site, CB2Vec sums all referenced embedding rows, applies `Identity`
+or `Relu`, and then reduces activated sites into model groups with `Sum` or
+`Mean`. The pooled vector is evaluated by the same `score_f32` linear/FM head
+used after training.
+
+Inputs must include every site that contributes to the pooling denominator,
+including sites with an empty token range. Perspective or color remapping is a
+domain responsibility and must happen before token IDs are passed to CB2Vec.
+The topology matches FIGRID's trainer, but 0.2 does not promise bit-for-bit
+reproduction of historical checkpoints, RNG streams, or sparse-Adam updates.
+
+`Trainer` uses deterministic initialization and Fisher-Yates shuffling from a
+caller-controlled seed. A mini-batch is evaluated against frozen weights,
+weighted gradients are averaged once, and one bias-corrected Adam step is
+applied. Repeated appearances of the same token accumulate into the same
+embedding gradient.
+
+Available objectives are:
+
+- `BinaryCrossEntropyWithLogits`, with stable logit-space loss and targets in
+  `0.0..=1.0`;
+- `MeanSquaredError`, applied to the raw score.
+
+`evaluate`, `train_batch`, `train_epoch`, and `train_epochs` return loss,
+sample, batch, optimizer-step, and epoch metrics. Invalid offsets, tokens,
+groups, targets, or sample weights are rejected before a batch mutates the
+model.
+
+This is ordinary FP32 training followed by post-training quantization (PTQ).
+Quantization-aware training (QAT) is not part of 0.2.
+
+Version 0.2 checkpoints model weights through the existing JSON/artifact
+paths. It does not serialize Adam moments, shuffle RNG state, or epoch state;
+constructing a new `Trainer` from saved weights starts a fresh optimizer.
 
 ## Attaching a policy
 
@@ -140,12 +213,17 @@ complete make/materialize/undo round trip.
 `QuantizedCodebookWeights` stores the same logical model with separate
 positive scales for embeddings, the linear head, and FM factors. The initial
 FIGRID deployment uses scales 32, 64, and 64; callers may choose other scales
-with `quantize_i16`.
+with `quantize_i16`. `Trainer::into_weights` returns the existing
+`CodebookWeights`, so no conversion layer is needed before quantization or
+artifact packing.
 
 The checked `score_f32` function consumes already normalized floating-point
 features. `score_quantized_uniform` consumes integer grouped sums when every
-group has the same pooling divisor. Both return an error for an invalid feature
-shape; the quantized scorer also rejects a zero divisor.
+group has the same pooling divisor. `score_quantized_grouped` accepts a
+different positive divisor per group, and `predict_quantized` performs the
+complete checked token → activation → grouping → quantized-score path. These
+functions reject invalid feature shapes, token/group IDs, arithmetic overflow,
+and zero divisors.
 
 ## Flat and factored storage
 
@@ -198,17 +276,23 @@ undo arbitrary external side effects.
 
 ## Scope and non-goals
 
-CB2Vec 0.1 focuses on inference, storage, and reversible state changes. It
-does not yet provide:
+CB2Vec 0.2 covers categorical value-model training, PTQ, artifact storage,
+inference, and reversible state changes. It does not provide:
 
 - vocabulary construction or tokenization;
-- gradient training, QAT, or an optimizer;
+- QAT or reinforcement-learning orchestration;
 - legal-action masking or a policy head;
 - board symmetry or color-perspective semantics;
-- SIMD, a C ABI, or a `no_std` contract.
+- SIMD, a stable C ABI, or a `no_std` contract.
 
 Policy or value heads built for one game should remain in that game's adapter
 until a second domain demonstrates the same abstraction.
+
+For Unity, the intended next layer is a separate `cb2vec-capi` crate with an
+opaque model handle, explicit `InferenceConfig`, and batched C ABI. The core
+intentionally does not expose a misleading Rust-only `cdylib`: Unity
+deployment should load a quantized artifact and cross P/Invoke only for coarse
+batch operations.
 
 ## Evidence and provenance
 
@@ -228,9 +312,9 @@ CB2Vec consumer. Workload-level performance still depends on token locality,
 embedding dimension, group layout, and search behavior.
 
 The standalone `v0.1.0` root preserves the exact `crates/cb2vec` tree from
-FIGRID commit `54d5807`. Version 0.1.1 changes repository metadata,
-documentation, tests, and continuous integration only; its runtime
-implementation and artifact format are unchanged.
+FIGRID commit `54d5807`. Version 0.2 generalizes the FP32 training graph used
+by FIGRID while keeping the v1 binary artifact and all 0.1 inference APIs
+compatible.
 
 ## Relationship to NORU
 
@@ -238,7 +322,12 @@ implementation and artifact format are unchanged.
 
 - NORU maps sparse global features through an NNUE accumulator and dense MLP.
 - CB2Vec maps local categorical tokens through shared embeddings and a small
-  grouped head.
+  grouped linear/FM head.
+
+Both now provide a pure-Rust FP32 trainer and integer deployment weights. Use
+NORU when your representation is naturally a sparse global feature set; use
+CB2Vec when multiple local categorical observations should share learned
+embedding rows before grouped pooling.
 
 [figrid-board](https://crates.io/crates/figrid-board) uses NORU for its
 legacy NNUE lineage and CB2Vec for the promoted codebook evaluator.
@@ -251,11 +340,12 @@ cargo test --locked --all-features
 cargo test --locked --no-default-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
+cargo run --locked --example train_value
 cargo package --locked
 ```
 
-Generic model, journal, factored-storage, and artifact tests live in this
-crate. Game-level integration tests remain in
+Numerical gradient, convergence, model, journal, factored-storage, and
+artifact tests live in this crate. Game-level integration tests remain in
 [figrid-board](https://github.com/nicotina04/figrid-board) beside its adapter.
 
 ## License

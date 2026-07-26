@@ -2,6 +2,26 @@
 
 All notable changes to CB2Vec are documented in this file.
 
+## 0.2.0 - 2026-07-26
+
+- Add the site-preserving `GroupedTokens` input and the same activation/grouped
+  pooling topology used by the deployed codebook evaluator.
+- Add a deterministic pure-Rust FP32 `Trainer` with weighted mini-batches,
+  Adam, stable binary cross entropy with logits, and raw-score mean squared
+  error.
+- Add deterministic model initialization, optional epoch shuffling, batch and
+  epoch metrics, evaluation, and probability prediction.
+- Cover embedding, linear-head, FM-factor, and bias gradients with central
+  differences; cover repeated-token accumulation, ReLU boundaries, rank-zero
+  heads, convergence, invalid-input atomicity, and partial batches.
+- Add `InferenceConfig`, unequal-group quantized scoring, and a checked
+  token-to-quantized-score path; verify nontrivial ReLU/mean inference through
+  a `CB2VEC01` artifact.
+- Reject feature-sum and sample-weight overflow, and preflight Adam updates so
+  numerical errors do not partially mutate trainer state.
+- Add an end-to-end `train_value` example.
+- Keep artifact format version 1 and all 0.1 inference APIs compatible.
+
 ## 0.1.1 - 2026-07-26
 
 - Move the canonical repository to

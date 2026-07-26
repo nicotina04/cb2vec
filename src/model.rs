@@ -109,6 +109,10 @@ pub enum ModelError {
         actual: usize,
         expected: usize,
     },
+    GroupLength {
+        actual: usize,
+        expected: usize,
+    },
     InvalidJson(String),
 }
 
@@ -138,6 +142,10 @@ impl fmt::Display for ModelError {
             Self::FeatureLength { actual, expected } => write!(
                 f,
                 "feature length mismatch: got {actual}, expected {expected}"
+            ),
+            Self::GroupLength { actual, expected } => write!(
+                f,
+                "group divisor length mismatch: got {actual}, expected {expected}"
             ),
             Self::InvalidJson(message) => write!(f, "invalid codebook JSON: {message}"),
         }
@@ -810,6 +818,59 @@ pub fn score_quantized_uniform<W: QuantizedCodebookAccess>(
     Ok(logit)
 }
 
+/// Scores integer grouped sums with an independent positive divisor per group.
+///
+/// This is the deployment counterpart of grouped mean pooling when groups do
+/// not all contain the same number of sites. Sum pooling uses a divisor of one
+/// for every group.
+#[inline]
+pub fn score_quantized_grouped<W: QuantizedCodebookAccess>(
+    features: &[i32],
+    weights: &W,
+    group_divisors: &[usize],
+) -> Result<f32, ModelError> {
+    validate_quantized_score_inputs(features, weights, 1)?;
+    if group_divisors.len() != weights.group_count() {
+        return Err(ModelError::GroupLength {
+            actual: group_divisors.len(),
+            expected: weights.group_count(),
+        });
+    }
+    if group_divisors.contains(&0) {
+        return Err(ModelError::ZeroDimension("group_divisor"));
+    }
+
+    let dim = weights.dim();
+    let embedding_scale = weights.embedding_scale() as f64;
+    let head_scale = weights.head_scale() as f64;
+    let factor_scale = weights.factor_scale() as f64;
+    let mut logit = weights.bias() as f64;
+
+    for (index, (&feature, &head)) in features.iter().zip(weights.head()).enumerate() {
+        let divisor = group_divisors[index / dim] as f64;
+        logit += (feature as f64 * head as f64) / (embedding_scale * divisor * head_scale);
+    }
+
+    for rank in 0..weights.fm_rank() {
+        let mut sum = 0.0f64;
+        let mut square_sum = 0.0f64;
+        for (index, &feature) in features.iter().enumerate() {
+            let divisor = group_divisors[index / dim] as f64;
+            let factor = weights.factors()[index * weights.fm_rank() + rank] as f64;
+            let product = (feature as f64 * factor) / (embedding_scale * divisor * factor_scale);
+            sum += product;
+            square_sum += product * product;
+        }
+        logit += 0.5 * (sum * sum - square_sum);
+    }
+
+    let logit = logit as f32;
+    if !logit.is_finite() {
+        return Err(ModelError::NonFinite("score"));
+    }
+    Ok(logit)
+}
+
 fn validate_float_score_inputs<W: FloatCodebookAccess>(
     features: &[f32],
     weights: &W,
@@ -1213,6 +1274,17 @@ mod tests {
         ));
         assert!(matches!(
             score_quantized_uniform(&quantized_features, &quantized, 0),
+            Err(ModelError::ZeroDimension("group_divisor"))
+        ));
+        assert!(matches!(
+            score_quantized_grouped(&quantized_features, &quantized, &[1, 1]),
+            Err(ModelError::GroupLength {
+                actual: 2,
+                expected: 3,
+            })
+        ));
+        assert!(matches!(
+            score_quantized_grouped(&quantized_features, &quantized, &[1, 0, 1]),
             Err(ModelError::ZeroDimension("group_divisor"))
         ));
     }

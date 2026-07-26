@@ -42,6 +42,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: cargo run --locked --example flat_roundtrip
       - run: cargo run --locked --example reversible_journal
+      - run: cargo run --locked --example train_value
       - run: cargo package --locked
 
   msrv:

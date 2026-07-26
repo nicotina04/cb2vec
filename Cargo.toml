@@ -1,6 +1,6 @@
 [package]
 name = "cb2vec"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["nicotina04 <devherdson@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"
@@ -9,8 +9,8 @@ repository = "https://github.com/nicotina04/cb2vec"
 homepage = "https://github.com/nicotina04/cb2vec"
 documentation = "https://docs.rs/cb2vec"
 readme = "README.md"
-description = "Exact categorical codebook embeddings and reversible token deltas for Rust search engines"
-keywords = ["embedding", "game-ai", "incremental", "search"]
+description = "Train, quantize, and incrementally deploy categorical codebook value models in pure Rust"
+keywords = ["embedding", "game-ai", "training", "quantization"]
 categories = ["algorithms", "game-development"]
 include = [
     "/src/**",
