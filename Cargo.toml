@@ -1,6 +1,6 @@
 [package]
 name = "cb2vec"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["nicotina04 <devherdson@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"
@@ -15,11 +15,20 @@ categories = ["algorithms", "game-development"]
 include = [
     "/src/**",
     "/examples/**",
+    "/include/**",
+    "/bindings/csharp/*.cs",
+    "/bindings/csharp/*.csproj",
+    "/bindings/csharp/smoke/*.cs",
+    "/bindings/csharp/smoke/*.csproj",
     "/Cargo.toml",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE-*",
 ]
+
+[lib]
+name = "cb2vec"
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["json"]
@@ -30,6 +39,9 @@ serde_json = { version = "1", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
+
+[profile.release]
+panic = "unwind"
 
 [workspace]
 resolver = "3"

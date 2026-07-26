@@ -20,6 +20,8 @@ extracted from FIGRID's deployed codebook evaluator. It provides:
 - site activation and grouped sum/mean pooling;
 - floating-point and `i16` codebook model representations;
 - post-training quantization and a versioned binary artifact;
+- one-crate Rust `rlib` plus C ABI `cdylib` deployment;
+- native FP32 training, PTQ, artifact I/O, and inference from Unity/C/C++;
 - exact integer embedding lookup and replacement deltas;
 - grouped linear and factorization-machine scoring;
 - exact class-base plus `i8` residual storage;
@@ -124,6 +126,166 @@ cb2vec = { version = "0.2", default-features = false }
 
 CB2Vec 0.2 requires Rust 1.88 or newer. Training and binary artifacts do not
 require an optional feature.
+
+## Native library and Unity
+
+CB2Vec follows the same single-crate native-library shape as NORU:
+
+```toml
+[lib]
+crate-type = ["rlib", "cdylib"]
+```
+
+One build therefore produces both the ordinary Rust library and a native
+dynamic library:
+
+| Platform | Native output |
+|---|---|
+| Windows | `target/release/cb2vec.dll` |
+| Linux | `target/release/libcb2vec.so` |
+| macOS | `target/release/libcb2vec.dylib` |
+| Android | ABI-specific `libcb2vec.so` |
+
+The stable C ABI 1.0 is declared in
+[`include/cb2vec.h`](include/cb2vec.h). The ready-to-copy Unity binding in
+[`bindings/csharp/CB2VecNative.cs`](bindings/csharp/CB2VecNative.cs) uses
+`SafeHandle`, pinned caller-owned arrays, fixed C layouts, and
+`[DllImport("cb2vec")]`. It exposes:
+
+- deterministic trainer creation and FP32 artifact restore;
+- flattened weighted evaluation, one-update batches, and full epochs;
+- trainer logits and probabilities;
+- PTQ into an independent immutable inference handle;
+- caller-buffer artifact export and artifact reload;
+- single and batched quantized inference.
+
+The flattened batch format concatenates all samples' tokens and sites. It has
+one global token-offset prefix table and a second prefix table delimiting the
+sites owned by each sample. No per-sample pointer graph crosses P/Invoke.
+
+The three version numbers are deliberately independent: crate `0.2.1`,
+artifact format `1`, and C ABI `1.0` (`0x00010000`). Artifact v1 does not store
+activation/pooling, so native model loading also takes an explicit
+`Cb2VecInferenceConfigV1`.
+
+### Windows, Linux, and macOS
+
+Build without the optional JSON parser when the native application only needs
+the binary artifact and trainer:
+
+```sh
+cargo build --release --no-default-features
+```
+
+For a Windows Unity Editor, copy `cb2vec.dll` and
+`bindings/csharp/CB2VecNative.cs` into the project, for example:
+
+```text
+Assets/
+  Plugins/
+    x86_64/
+      cb2vec.dll
+    CB2VecNative.cs
+```
+
+For Linux or macOS, copy `libcb2vec.so` or `libcb2vec.dylib` under
+`Assets/Plugins`, then select the matching Editor/Standalone OS and CPU in the
+Unity Plugin Inspector. The C# import name stays `cb2vec` on every platform;
+omit `lib` and the file extension.
+
+### Android `.so`
+
+Rust's Android targets require an Android NDK. `cargo-ndk` supplies the linker
+configuration and creates Android's ABI directory layout:
+
+```powershell
+rustup target add aarch64-linux-android `
+  armv7-linux-androideabi `
+  x86_64-linux-android
+cargo install cargo-ndk --locked --version 4.1.2
+
+# Unity Hub's NDK is suitable; change this to the installed Editor version.
+$env:ANDROID_NDK_HOME = `
+  'C:\Program Files\Unity\Hub\Editor\<version>\Editor\Data\PlaybackEngines\AndroidPlayer\NDK'
+
+# Match the Unity project's Minimum API Level.
+$env:CARGO_NDK_PLATFORM = '23'
+
+cargo ndk `
+  -t arm64-v8a `
+  -t armeabi-v7a `
+  -t x86_64 `
+  -o .\build\android\jniLibs `
+  build --release --no-default-features
+```
+
+The outputs are:
+
+```text
+build/android/jniLibs/
+  arm64-v8a/libcb2vec.so
+  armeabi-v7a/libcb2vec.so
+  x86_64/libcb2vec.so
+```
+
+Copy the required `.so` files anywhere under the Unity project's `Assets`
+folder (a conventional destination is
+`Assets/Plugins/Android/<abi>/libcb2vec.so`). In each file's Plugin Inspector,
+enable Android and select the CPU matching its ABI. `arm64-v8a` is the normal
+device build; `x86_64` is useful for an emulator, and `armeabi-v7a` is only
+needed when the project still supports 32-bit ARM.
+
+See the official
+[`cargo-ndk` build instructions](https://github.com/bbqsrc/cargo-ndk),
+[Rust Android target support](https://doc.rust-lang.org/rustc/platform-support/android.html),
+and [Unity Android native plug-in import guide](https://docs.unity3d.com/Manual/android-native-plugins-import.html).
+
+### Minimal Unity flow
+
+```csharp
+using CB2Vec;
+
+var shape = Cb2VecNative.DefaultShape();
+shape.TokenCount = 4;
+shape.GroupCount = 2;
+shape.Dim = 3;
+shape.FmRank = 2;
+
+var config = Cb2VecNative.DefaultTrainerConfig();
+config.BatchSize = 2;
+config.Shuffle = 0;
+
+var dataset = new Cb2VecTrainingBatch(
+    new ushort[] { 0, 0, 1, 2, 3, 1 },
+    new uint[] { 0, 2, 3, 3, 4, 6 }, // global site -> token offsets
+    new uint[] { 0, 0, 1, 0, 1 },    // global site -> group
+    new uint[] { 0, 3, 5 },          // sample -> site offsets
+    new float[] { 0.2f, 0.8f });
+var input = new Cb2VecInput(
+    new ushort[] { 0, 0, 1 },
+    new uint[] { 0, 2, 3, 3 },
+    new uint[] { 0, 0, 1 });
+
+using (var trainer = Cb2VecTrainer.Create(shape, config))
+{
+    var report = trainer.TrainEpoch(dataset);
+    var quant = Cb2VecNative.DefaultQuantization();
+    using (var model = trainer.Quantize(quant))
+    {
+        float score = model.Predict(input);
+    }
+    byte[] artifact = trainer.WriteArtifact(quant, new byte[32]);
+}
+```
+
+Trainer handles are not internally synchronized; serialize every call that
+uses the same trainer. Quantized model handles are immutable and may serve
+concurrent prediction calls as long as they are not disposed concurrently.
+The binding never retains managed pointers after a native call.
+The crate's direct release build pins `panic = "unwind"` so Rust panics can be
+converted into an ABI status. A parent Cargo workspace can override dependency
+profiles; if it deliberately selects `panic = "abort"`, no native library can
+recover from a Rust panic.
 
 ## Training model
 
@@ -268,7 +430,8 @@ See [`examples/flat_roundtrip.rs`](examples/flat_roundtrip.rs).
 - Journal push, materialize, and pop allocate nothing after construction.
 - Artifact parsing uses checked length arithmetic and rejects trailing data.
 - The crate contains no game, board, action, vocabulary, or search policy.
-- The crate contains no `unsafe` code.
+- The numerical core contains no `unsafe` code; audited raw-pointer handling is
+  isolated to `ffi`.
 
 A `TokenDeltaSink` must not panic. Sink mutations are deliberately
 non-transactional because rollback would add overhead and cannot generally
@@ -283,16 +446,15 @@ inference, and reversible state changes. It does not provide:
 - QAT or reinforcement-learning orchestration;
 - legal-action masking or a policy head;
 - board symmetry or color-perspective semantics;
-- SIMD, a stable C ABI, or a `no_std` contract.
+- SIMD, optimizer-state checkpoints, an incremental C session, or a `no_std`
+  contract.
 
 Policy or value heads built for one game should remain in that game's adapter
 until a second domain demonstrates the same abstraction.
 
-For Unity, the intended next layer is a separate `cb2vec-capi` crate with an
-opaque model handle, explicit `InferenceConfig`, and batched C ABI. The core
-intentionally does not expose a misleading Rust-only `cdylib`: Unity
-deployment should load a quantized artifact and cross P/Invoke only for coarse
-batch operations.
+The C ABI intentionally keeps the const-generic reversible journal on the Rust
+side. A future incremental native session can be added as a separate opaque
+handle without freezing game-specific state into ABI 1.0.
 
 ## Evidence and provenance
 
@@ -341,11 +503,18 @@ cargo test --locked --no-default-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
 cargo run --locked --example train_value
+cargo build --release --no-default-features
+dotnet build bindings/csharp/CB2VecNative.csproj --configuration Release
 cargo package --locked
 ```
 
 Numerical gradient, convergence, model, journal, factored-storage, and
-artifact tests live in this crate. Game-level integration tests remain in
+artifact tests live in this crate. ABI tests additionally cover layout,
+Rust/FFI training parity, invalid-input atomicity, PTQ/artifact parity,
+factored-load flattening, panic containment, C11/C++ header compilation, and
+the C# trainer-to-reload smoke flow. Android release builds have been checked
+as ELF64 AArch64, ELF32 ARM, and ELF64 x86-64, each exporting the same 23
+`cb2vec_*` symbols. Game-level integration tests remain in
 [figrid-board](https://github.com/nicotina04/figrid-board) beside its adapter.
 
 ## License

@@ -11,10 +11,12 @@
 //! mapping, and search policy remain responsibilities of the consuming
 //! application.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod artifact;
 mod factored;
+#[allow(unsafe_code)]
+pub mod ffi;
 mod journal;
 mod model;
 mod trainer;

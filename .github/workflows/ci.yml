@@ -53,3 +53,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test --locked --all-targets --all-features
       - run: cargo test --locked --all-targets --no-default-features
+
+  native:
+    name: C ABI and C# P/Invoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: cargo build --locked --release --no-default-features
+      - name: Verify exported C symbol allowlist
+        run: |
+          nm -D --defined-only target/release/libcb2vec.so \
+            | awk '$3 ~ /^cb2vec_/ { print $3 }' \
+            | sort > target/release/cb2vec.symbols
+          diff -u include/cb2vec.symbols target/release/cb2vec.symbols
+      - name: Compile and run C11 smoke
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -Iinclude examples/c_api_smoke.c \
+            -Ltarget/release -lcb2vec \
+            -Wl,-rpath,"$PWD/target/release" \
+            -o target/release/c_api_smoke
+          target/release/c_api_smoke
+      - name: Compile header as C++17
+        run: |
+          c++ -x c++ -std=c++17 -Wall -Wextra -Werror \
+            -Iinclude -c examples/c_api_smoke.c \
+            -o target/release/c_api_smoke_cpp.o
+      - run: dotnet build bindings/csharp/CB2VecNative.csproj --configuration Release --nologo
+      - name: Run C# trainer/PTQ/reload smoke
+        run: dotnet run --project bindings/csharp/smoke/CB2VecSmoke.csproj --configuration Release --nologo
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+  android:
+    name: Android cdylibs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      - name: Build Android shared libraries
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o target/android/jniLibs build --release --no-default-features
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CARGO_NDK_PLATFORM: "23"
+      - run: test -s target/android/jniLibs/arm64-v8a/libcb2vec.so
+      - run: test -s target/android/jniLibs/armeabi-v7a/libcb2vec.so
+      - run: test -s target/android/jniLibs/x86_64/libcb2vec.so

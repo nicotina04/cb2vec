@@ -2,6 +2,23 @@
 
 All notable changes to CB2Vec are documented in this file.
 
+## 0.2.1 - 2026-07-26
+
+- Build the same crate as both a Rust `rlib` and native `cdylib`, producing
+  `cb2vec.dll`, `libcb2vec.so`, or `libcb2vec.dylib`.
+- Add stable C ABI 1.0 opaque trainer/model handles with thread-local errors,
+  panic containment, fixed-width layouts, checked pointers, and caller-owned
+  buffers.
+- Expose deterministic trainer creation and FP32 artifact restore, flattened
+  batch evaluation/training, full epochs, prediction, PTQ, artifact export,
+  artifact loading, and single/batch quantized inference.
+- Add a checked-in C11/C++ header and a Unity C# binding with layout checks,
+  `SafeHandle`, pinned arrays, and a trainer/PTQ/reload smoke project.
+- Document Windows, Linux, macOS, and `cargo-ndk` Android builds plus Unity
+  plug-in placement.
+- Verify Windows C11 and C# end-to-end dynamic-library calls and build
+  `libcb2vec.so` for `arm64-v8a`, `armeabi-v7a`, and `x86_64`.
+
 ## 0.2.0 - 2026-07-26
 
 - Add the site-preserving `GroupedTokens` input and the same activation/grouped
