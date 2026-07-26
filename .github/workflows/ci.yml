@@ -20,7 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --all-targets --all-features
       - run: cargo test --locked --all-targets --no-default-features
@@ -29,8 +29,10 @@ jobs:
     name: Formatting, lints, docs, and package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+      # Keep lint results tied to the declared MSRV. Stable tests above still
+      # catch compatibility with newer compilers without future Clippy churn.
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all --check
@@ -46,7 +48,7 @@ jobs:
     name: MSRV 1.88
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo test --locked --all-targets --all-features
       - run: cargo test --locked --all-targets --no-default-features
