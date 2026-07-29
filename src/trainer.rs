@@ -652,11 +652,11 @@ fn validate_quantized_shape<W: QuantizedCodebookAccess>(
 /// sample weights, and applied with one dense Adam step per batch.
 #[derive(Clone, Debug)]
 pub struct Trainer {
-    weights: CodebookWeights,
-    config: TrainerConfig,
-    adam: AdamState,
-    shuffle_rng: Rng64,
-    completed_epochs: u64,
+    pub(crate) weights: CodebookWeights,
+    pub(crate) config: TrainerConfig,
+    pub(crate) adam: AdamState,
+    pub(crate) shuffle_rng: Rng64,
+    pub(crate) completed_epochs: u64,
 }
 
 impl Trainer {
@@ -1108,22 +1108,22 @@ fn accumulate_sample_gradient(
 }
 
 #[derive(Clone, Debug)]
-struct AdamState {
-    embedding_m: Vec<f32>,
-    embedding_v: Vec<f32>,
-    head_m: Vec<f32>,
-    head_v: Vec<f32>,
-    factor_m: Vec<f32>,
-    factor_v: Vec<f32>,
-    bias_m: f32,
-    bias_v: f32,
-    beta1_power: f32,
-    beta2_power: f32,
-    step: u64,
+pub(crate) struct AdamState {
+    pub(crate) embedding_m: Vec<f32>,
+    pub(crate) embedding_v: Vec<f32>,
+    pub(crate) head_m: Vec<f32>,
+    pub(crate) head_v: Vec<f32>,
+    pub(crate) factor_m: Vec<f32>,
+    pub(crate) factor_v: Vec<f32>,
+    pub(crate) bias_m: f32,
+    pub(crate) bias_v: f32,
+    pub(crate) beta1_power: f32,
+    pub(crate) beta2_power: f32,
+    pub(crate) step: u64,
 }
 
 impl AdamState {
-    fn new(weights: &CodebookWeights) -> Self {
+    pub(crate) fn new(weights: &CodebookWeights) -> Self {
         Self {
             embedding_m: vec![0.0; weights.embeddings.len()],
             embedding_v: vec![0.0; weights.embeddings.len()],
@@ -1369,13 +1369,13 @@ fn random_normal_vec(rng: &mut Rng64, len: usize, stddev: f32) -> Vec<f32> {
 }
 
 #[derive(Clone, Debug)]
-struct Rng64 {
-    state: u64,
-    spare_normal: Option<f32>,
+pub(crate) struct Rng64 {
+    pub(crate) state: u64,
+    pub(crate) spare_normal: Option<f32>,
 }
 
 impl Rng64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
                 0x9E37_79B9_7F4A_7C15

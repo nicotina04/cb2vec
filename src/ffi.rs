@@ -7,21 +7,31 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
-use std::ffi::{CString, c_char};
+use std::ffi::c_char;
 use std::fmt;
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
 
 use crate::{
-    Activation, AdamConfig, GroupedTokens, InferenceConfig, Loss, ModelShape,
-    PackedCodebookArtifact, PackedQuantizedPayload, Pooling, Trainer, TrainerConfig, TrainingError,
-    TrainingMetrics, TrainingSample, predict_quantized,
+    Activation, AdamConfig, ArtifactMetadata, CheckpointError, GroupedTokens, IncrementalSession,
+    InferenceConfig, Loss, ModelShape, PackedCodebookArtifact, PackedQuantizedPayload, Pooling,
+    SessionDelta, SessionError, SessionLimits, Trainer, TrainerCheckpoint, TrainerConfig,
+    TrainingError, TrainingMetrics, TrainingSample, predict_quantized,
 };
 
-/// ABI major 1, minor 0.
-pub const CB2VEC_ABI_VERSION: u32 = 0x0001_0000;
+/// ABI major 1, minor 1.
+///
+/// Minor revisions are purely additive: every ABI 1.0 symbol keeps its
+/// signature and semantics, and every versioned struct still accepts
+/// [`CB2VEC_ABI_VERSION_1_0`] in its `abi_version` field. Callers should
+/// require `major == 1` rather than an exact match.
+pub const CB2VEC_ABI_VERSION: u32 = 0x0001_0001;
+
+/// The original ABI revision, still accepted by every `_v1` entry point.
+pub const CB2VEC_ABI_VERSION_1_0: u32 = 0x0001_0000;
 
 pub const CB2VEC_OK: i32 = 0;
 pub const CB2VEC_ERROR_NULL_POINTER: i32 = -1;
@@ -31,6 +41,14 @@ pub const CB2VEC_ERROR_ARTIFACT: i32 = -4;
 pub const CB2VEC_ERROR_MODEL: i32 = -5;
 pub const CB2VEC_ERROR_NUMERIC: i32 = -6;
 pub const CB2VEC_ERROR_BUFFER_TOO_SMALL: i32 = -7;
+/// A session capacity chosen at creation was exceeded. Added in ABI 1.1.
+pub const CB2VEC_ERROR_LIMIT_EXCEEDED: i32 = -8;
+/// The operation is not valid for the handle's current state. Added in 1.1.
+pub const CB2VEC_ERROR_STATE: i32 = -9;
+/// A trainer checkpoint was corrupt or incompatible. Added in ABI 1.1.
+pub const CB2VEC_ERROR_CHECKPOINT: i32 = -10;
+/// A required allocation failed. Added in ABI 1.1.
+pub const CB2VEC_ERROR_OUT_OF_MEMORY: i32 = -11;
 pub const CB2VEC_ERROR_PANIC: i32 = -127;
 
 pub const CB2VEC_ACTIVATION_IDENTITY: u32 = 0;
@@ -48,8 +66,13 @@ pub const CB2VEC_MODEL_FLAG_FLATTENED_AT_LOAD: u32 = 2;
 static LIBRARY_VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 thread_local! {
-    static LAST_ERROR: RefCell<CString> =
-        RefCell::new(CString::new(Vec::new()).expect("empty CString"));
+    /// NUL-terminated message buffer, never empty.
+    ///
+    /// A plain byte buffer rather than a `CString` so that clearing the error
+    /// at the start of every call reuses its capacity. That keeps the
+    /// documented allocation-free session loop allocation-free all the way
+    /// down to the C boundary.
+    static LAST_ERROR: RefCell<Vec<u8>> = RefCell::new(vec![0u8]);
 }
 
 /// Opaque FP32 trainer handle.
@@ -58,11 +81,21 @@ pub struct Cb2VecTrainer {
 }
 
 /// Opaque immutable quantized-model handle.
+///
+/// The weights sit behind an [`Arc`] so a session created from this model
+/// keeps them alive even if the model handle is freed first.
 pub struct Cb2VecWeights {
-    payload: PackedQuantizedPayload,
+    payload: Arc<PackedQuantizedPayload>,
     inference: InferenceConfig,
     original_kind: u32,
     flags: u32,
+    artifact_version: u32,
+    metadata: ArtifactMetadata,
+}
+
+/// Opaque single-owner incremental search session handle.
+pub struct Cb2VecSession {
+    session: IncrementalSession<Arc<PackedQuantizedPayload>>,
 }
 
 /// Fixed-layout model shape for ABI v1.
@@ -293,16 +326,191 @@ impl Default for Cb2VecModelInfoV1 {
     }
 }
 
+/// Fixed capacities for one incremental search session. Added in ABI 1.1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cb2VecSessionConfigV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub max_sites: u32,
+    pub max_token_slots: u32,
+    pub max_deltas_per_frame: u32,
+    pub max_depth: u32,
+    pub flags: u32,
+    pub reserved: [u32; 1],
+}
+
+impl Default for Cb2VecSessionConfigV1 {
+    fn default() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: CB2VEC_ABI_VERSION,
+            max_sites: 256,
+            max_token_slots: 1024,
+            max_deltas_per_frame: 8,
+            max_depth: 64,
+            flags: 0,
+            reserved: [0; 1],
+        }
+    }
+}
+
+/// One token replacement in a pushed search frame. Added in ABI 1.1.
+///
+/// Layout-identical to [`SessionDelta`], so `cb2vec_session_push_v1` borrows a
+/// caller array directly instead of converting it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Cb2VecTokenDeltaV1 {
+    pub site: u32,
+    pub lane: u32,
+    pub old_token: u16,
+    pub new_token: u16,
+}
+
+/// Observable session state. Added in ABI 1.1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cb2VecSessionInfoV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub site_count: u32,
+    pub token_slots: u32,
+    pub group_count: u32,
+    pub depth: u32,
+    pub materialized_depth: u32,
+    pub pending_deltas: u32,
+    pub max_sites: u32,
+    pub max_token_slots: u32,
+    pub max_deltas_per_frame: u32,
+    pub max_depth: u32,
+    pub activation: u32,
+    pub pooling: u32,
+    pub flags: u32,
+    pub reserved: [u32; 1],
+}
+
+impl Default for Cb2VecSessionInfoV1 {
+    fn default() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: CB2VEC_ABI_VERSION,
+            site_count: 0,
+            token_slots: 0,
+            group_count: 0,
+            depth: 0,
+            materialized_depth: 0,
+            pending_deltas: 0,
+            max_sites: 0,
+            max_token_slots: 0,
+            max_deltas_per_frame: 0,
+            max_depth: 0,
+            activation: CB2VEC_ACTIVATION_IDENTITY,
+            pooling: CB2VEC_POOLING_SUM,
+            flags: 0,
+            reserved: [0; 1],
+        }
+    }
+}
+
+/// Consumer-defined schema identity written into a v2 artifact. Added in 1.1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cb2VecArtifactMetadataV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub schema_version: u32,
+    pub flags: u32,
+    pub schema_digest: [u8; 16],
+}
+
+impl Default for Cb2VecArtifactMetadataV1 {
+    fn default() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: CB2VEC_ABI_VERSION,
+            schema_version: 0,
+            flags: 0,
+            schema_digest: [0; 16],
+        }
+    }
+}
+
+/// Everything readable from artifact bytes without building a model.
+/// Added in ABI 1.1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cb2VecArtifactInfoV1 {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub artifact_version: u32,
+    pub kind: u32,
+    pub token_count: u32,
+    pub group_count: u32,
+    pub dim: u32,
+    pub fm_rank: u32,
+    pub has_inference_config: u32,
+    pub activation: u32,
+    pub pooling: u32,
+    pub schema_version: u32,
+    pub embedding_scale: i32,
+    pub head_scale: i32,
+    pub factor_scale: i32,
+    pub flags: u32,
+    pub source_sha256: [u8; 32],
+    pub schema_digest: [u8; 16],
+}
+
+impl Default for Cb2VecArtifactInfoV1 {
+    fn default() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: CB2VEC_ABI_VERSION,
+            artifact_version: 0,
+            kind: CB2VEC_MODEL_KIND_FLAT,
+            token_count: 0,
+            group_count: 0,
+            dim: 0,
+            fm_rank: 0,
+            has_inference_config: 0,
+            activation: CB2VEC_ACTIVATION_IDENTITY,
+            pooling: CB2VEC_POOLING_SUM,
+            schema_version: 0,
+            embedding_scale: 0,
+            head_scale: 0,
+            factor_scale: 0,
+            flags: 0,
+            source_sha256: [0; 32],
+            schema_digest: [0; 16],
+        }
+    }
+}
+
 const _: [(); 32] = [(); size_of::<Cb2VecModelShapeV1>()];
 const _: [(); 64] = [(); size_of::<Cb2VecTrainerConfigV1>()];
 const _: [(); 32] = [(); size_of::<Cb2VecQuantizationConfigV1>()];
 const _: [(); 16] = [(); size_of::<Cb2VecInferenceConfigV1>()];
 const _: [(); 64] = [(); size_of::<Cb2VecTrainingMetricsV1>()];
 const _: [(); 64] = [(); size_of::<Cb2VecModelInfoV1>()];
+const _: [(); 32] = [(); size_of::<Cb2VecSessionConfigV1>()];
+const _: [(); 12] = [(); size_of::<Cb2VecTokenDeltaV1>()];
+const _: [(); 64] = [(); size_of::<Cb2VecSessionInfoV1>()];
+const _: [(); 32] = [(); size_of::<Cb2VecArtifactMetadataV1>()];
+const _: [(); 112] = [(); size_of::<Cb2VecArtifactInfoV1>()];
 #[cfg(target_pointer_width = "64")]
 const _: [(); 72] = [(); size_of::<Cb2VecTrainingBatchV1>()];
 #[cfg(target_pointer_width = "32")]
 const _: [(); 48] = [(); size_of::<Cb2VecTrainingBatchV1>()];
+
+// `cb2vec_session_push_v1` reinterprets the caller's `Cb2VecTokenDeltaV1`
+// array as `&[SessionDelta]`. These assertions are what make that sound; if
+// either type's layout ever drifts, the crate stops compiling.
+const _: [(); size_of::<Cb2VecTokenDeltaV1>()] = [(); size_of::<SessionDelta>()];
+const _: [(); align_of::<Cb2VecTokenDeltaV1>()] = [(); align_of::<SessionDelta>()];
+const _: [(); offset_of!(Cb2VecTokenDeltaV1, site)] = [(); offset_of!(SessionDelta, site)];
+const _: [(); offset_of!(Cb2VecTokenDeltaV1, lane)] = [(); offset_of!(SessionDelta, lane)];
+const _: [(); offset_of!(Cb2VecTokenDeltaV1, old_token)] = [(); offset_of!(SessionDelta, old)];
+const _: [(); offset_of!(Cb2VecTokenDeltaV1, new_token)] = [(); offset_of!(SessionDelta, new)];
 
 #[derive(Debug)]
 enum FfiError {
@@ -313,6 +521,10 @@ enum FfiError {
     Model(String),
     Numeric(String),
     BufferTooSmall { required: usize, capacity: usize },
+    LimitExceeded(String),
+    State(String),
+    Checkpoint(String),
+    OutOfMemory(String),
 }
 
 impl FfiError {
@@ -325,6 +537,10 @@ impl FfiError {
             Self::Model(_) => CB2VEC_ERROR_MODEL,
             Self::Numeric(_) => CB2VEC_ERROR_NUMERIC,
             Self::BufferTooSmall { .. } => CB2VEC_ERROR_BUFFER_TOO_SMALL,
+            Self::LimitExceeded(_) => CB2VEC_ERROR_LIMIT_EXCEEDED,
+            Self::State(_) => CB2VEC_ERROR_STATE,
+            Self::Checkpoint(_) => CB2VEC_ERROR_CHECKPOINT,
+            Self::OutOfMemory(_) => CB2VEC_ERROR_OUT_OF_MEMORY,
         }
     }
 }
@@ -337,7 +553,11 @@ impl fmt::Display for FfiError {
             | Self::Abi(message)
             | Self::Artifact(message)
             | Self::Model(message)
-            | Self::Numeric(message) => f.write_str(message),
+            | Self::Numeric(message)
+            | Self::LimitExceeded(message)
+            | Self::State(message)
+            | Self::Checkpoint(message)
+            | Self::OutOfMemory(message) => f.write_str(message),
             Self::BufferTooSmall { required, capacity } => write!(
                 f,
                 "output buffer is too small: capacity {capacity}, required {required}"
@@ -346,17 +566,44 @@ impl fmt::Display for FfiError {
     }
 }
 
+/// Maps a session failure onto the narrowest status a caller can act on.
+fn map_session_error(error: SessionError) -> FfiError {
+    let message = error.to_string();
+    match error {
+        SessionError::Model(_) => FfiError::Model(message),
+        SessionError::LimitExceeded { .. } => FfiError::LimitExceeded(message),
+        SessionError::NotReady | SessionError::EmptyStack => FfiError::State(message),
+        SessionError::AllocationFailed { .. } => FfiError::OutOfMemory(message),
+        _ => FfiError::Invalid(message),
+    }
+}
+
+fn map_checkpoint_error(error: CheckpointError) -> FfiError {
+    FfiError::Checkpoint(error.to_string())
+}
+
 fn clear_last_error() {
     LAST_ERROR.with(|slot| {
-        *slot.borrow_mut() = CString::new(Vec::new()).expect("empty CString");
+        let mut buffer = slot.borrow_mut();
+        buffer.truncate(1);
+        buffer[0] = 0;
     });
 }
 
 fn set_last_error(message: impl fmt::Display) {
-    let sanitized = message.to_string().replace('\0', "\\0");
+    let text = message.to_string();
     LAST_ERROR.with(|slot| {
-        *slot.borrow_mut() =
-            CString::new(sanitized).expect("NUL bytes were replaced before CString creation");
+        let mut buffer = slot.borrow_mut();
+        buffer.clear();
+        // Interior NUL bytes would truncate the C string, so escape them.
+        for &byte in text.as_bytes() {
+            if byte == 0 {
+                buffer.extend_from_slice(b"\\0");
+            } else {
+                buffer.push(byte);
+            }
+        }
+        buffer.push(0);
     });
 }
 
@@ -479,6 +726,20 @@ unsafe fn weights_ref<'a>(pointer: *const Cb2VecWeights) -> Result<&'a Cb2VecWei
     Ok(unsafe { &*pointer })
 }
 
+unsafe fn session_ref<'a>(pointer: *const Cb2VecSession) -> Result<&'a Cb2VecSession, FfiError> {
+    validate_pointer(pointer, "session")?;
+    // SAFETY: A non-null, aligned pointer returned by cb2vec_session_create_v1
+    // remains valid until its matching free call.
+    Ok(unsafe { &*pointer })
+}
+
+unsafe fn session_mut<'a>(pointer: *mut Cb2VecSession) -> Result<&'a mut Cb2VecSession, FfiError> {
+    validate_mut_pointer(pointer, "session")?;
+    // SAFETY: A session is single-owner, so the caller guarantees exclusive
+    // access to a live handle for the duration of this mutating call.
+    Ok(unsafe { &mut *pointer })
+}
+
 fn activation_from_ffi(value: u32) -> Result<Activation, FfiError> {
     match value {
         CB2VEC_ACTIVATION_IDENTITY => Ok(Activation::Identity),
@@ -528,6 +789,22 @@ const fn loss_to_ffi(value: Loss) -> u32 {
     }
 }
 
+/// Accepts any ABI revision this build is source-compatible with.
+///
+/// Minor revisions are additive, so a caller built against ABI 1.0 keeps
+/// working against a 1.1 library. A newer minor than this build understands,
+/// or any other major, is rejected.
+fn check_abi_version(value: u32, what: &'static str) -> Result<(), FfiError> {
+    let major = value >> 16;
+    let minor = value & 0xFFFF;
+    if major != CB2VEC_ABI_VERSION >> 16 || minor > (CB2VEC_ABI_VERSION & 0xFFFF) {
+        return Err(FfiError::Abi(format!(
+            "{what} ABI is 0x{value:08x}, but this build supports 0x{CB2VEC_ABI_VERSION:08x}"
+        )));
+    }
+    Ok(())
+}
+
 fn decode_shape(shape: Cb2VecModelShapeV1) -> Result<ModelShape, FfiError> {
     if shape.struct_size != size_of::<Cb2VecModelShapeV1>() as u32 {
         return Err(FfiError::Abi(format!(
@@ -536,12 +813,7 @@ fn decode_shape(shape: Cb2VecModelShapeV1) -> Result<ModelShape, FfiError> {
             size_of::<Cb2VecModelShapeV1>()
         )));
     }
-    if shape.abi_version != CB2VEC_ABI_VERSION {
-        return Err(FfiError::Abi(format!(
-            "model shape ABI is 0x{:08x}, expected 0x{CB2VEC_ABI_VERSION:08x}",
-            shape.abi_version
-        )));
-    }
+    check_abi_version(shape.abi_version, "model shape")?;
     if shape.reserved != [0; 2] {
         return Err(FfiError::Abi(
             "model shape reserved fields must be zero".to_string(),
@@ -564,12 +836,7 @@ fn decode_config(config: Cb2VecTrainerConfigV1) -> Result<TrainerConfig, FfiErro
             size_of::<Cb2VecTrainerConfigV1>()
         )));
     }
-    if config.abi_version != CB2VEC_ABI_VERSION {
-        return Err(FfiError::Abi(format!(
-            "trainer config ABI is 0x{:08x}, expected 0x{CB2VEC_ABI_VERSION:08x}",
-            config.abi_version
-        )));
-    }
+    check_abi_version(config.abi_version, "trainer config")?;
     if config.flags != 0 || config.reserved != [0; 2] {
         return Err(FfiError::Abi(
             "trainer config flags and reserved fields must be zero".to_string(),
@@ -611,12 +878,7 @@ fn decode_quantization(
             size_of::<Cb2VecQuantizationConfigV1>()
         )));
     }
-    if config.abi_version != CB2VEC_ABI_VERSION {
-        return Err(FfiError::Abi(format!(
-            "quantization config ABI is 0x{:08x}, expected 0x{CB2VEC_ABI_VERSION:08x}",
-            config.abi_version
-        )));
-    }
+    check_abi_version(config.abi_version, "quantization config")?;
     if config.flags != 0 || config.reserved != [0; 2] {
         return Err(FfiError::Abi(
             "quantization flags and reserved fields must be zero".to_string(),
@@ -646,6 +908,48 @@ fn decode_inference(config: Cb2VecInferenceConfigV1) -> Result<InferenceConfig, 
     Ok(InferenceConfig::new(
         activation_from_ffi(config.activation)?,
         pooling_from_ffi(config.pooling)?,
+    ))
+}
+
+fn decode_metadata(metadata: Cb2VecArtifactMetadataV1) -> Result<ArtifactMetadata, FfiError> {
+    if metadata.struct_size != size_of::<Cb2VecArtifactMetadataV1>() as u32 {
+        return Err(FfiError::Abi(format!(
+            "artifact metadata size is {}, expected {}",
+            metadata.struct_size,
+            size_of::<Cb2VecArtifactMetadataV1>()
+        )));
+    }
+    check_abi_version(metadata.abi_version, "artifact metadata")?;
+    if metadata.flags != 0 {
+        return Err(FfiError::Abi(
+            "artifact metadata flags must be zero".to_string(),
+        ));
+    }
+    Ok(ArtifactMetadata::new(
+        metadata.schema_version,
+        metadata.schema_digest,
+    ))
+}
+
+fn decode_session_config(config: Cb2VecSessionConfigV1) -> Result<SessionLimits, FfiError> {
+    if config.struct_size != size_of::<Cb2VecSessionConfigV1>() as u32 {
+        return Err(FfiError::Abi(format!(
+            "session config size is {}, expected {}",
+            config.struct_size,
+            size_of::<Cb2VecSessionConfigV1>()
+        )));
+    }
+    check_abi_version(config.abi_version, "session config")?;
+    if config.flags != 0 || config.reserved != [0; 1] {
+        return Err(FfiError::Abi(
+            "session config flags and reserved fields must be zero".to_string(),
+        ));
+    }
+    Ok(SessionLimits::new(
+        config.max_sites as usize,
+        config.max_token_slots as usize,
+        config.max_deltas_per_frame as usize,
+        config.max_depth as usize,
     ))
 }
 
@@ -910,8 +1214,10 @@ unsafe fn training_samples_from_raw(
         .collect())
 }
 
-fn quantized_info(weights: &Cb2VecWeights) -> Result<Cb2VecModelInfoV1, FfiError> {
-    let (shape, embedding_scale, head_scale, factor_scale) = match &weights.payload {
+fn payload_scales(
+    payload: &PackedQuantizedPayload,
+) -> Result<(ModelShape, i32, i32, i32), FfiError> {
+    Ok(match payload {
         PackedQuantizedPayload::Flat(model) => (
             model
                 .validate()
@@ -928,8 +1234,12 @@ fn quantized_info(weights: &Cb2VecWeights) -> Result<Cb2VecModelInfoV1, FfiError
             model.head_scale(),
             model.factor_scale(),
         ),
-    };
-    model_info(
+    })
+}
+
+fn quantized_info(weights: &Cb2VecWeights) -> Result<Cb2VecModelInfoV1, FfiError> {
+    let (shape, embedding_scale, head_scale, factor_scale) = payload_scales(&weights.payload)?;
+    let mut info = model_info(
         shape,
         weights.original_kind,
         weights.flags,
@@ -937,7 +1247,9 @@ fn quantized_info(weights: &Cb2VecWeights) -> Result<Cb2VecModelInfoV1, FfiError
         embedding_scale,
         head_scale,
         factor_scale,
-    )
+    )?;
+    info.artifact_version = weights.artifact_version;
+    Ok(info)
 }
 
 fn model_info(
@@ -950,14 +1262,10 @@ fn model_info(
     factor_scale: i32,
 ) -> Result<Cb2VecModelInfoV1, FfiError> {
     Ok(Cb2VecModelInfoV1 {
-        token_count: u32::try_from(shape.token_count())
-            .map_err(|_| FfiError::Model("token_count does not fit u32".to_string()))?,
-        group_count: u32::try_from(shape.group_count())
-            .map_err(|_| FfiError::Model("group_count does not fit u32".to_string()))?,
-        dim: u32::try_from(shape.dim())
-            .map_err(|_| FfiError::Model("dim does not fit u32".to_string()))?,
-        fm_rank: u32::try_from(shape.fm_rank())
-            .map_err(|_| FfiError::Model("fm_rank does not fit u32".to_string()))?,
+        token_count: shape_field(shape.token_count(), "token_count")?,
+        group_count: shape_field(shape.group_count(), "group_count")?,
+        dim: shape_field(shape.dim(), "dim")?,
+        fm_rank: shape_field(shape.fm_rank(), "fm_rank")?,
         kind,
         flags,
         activation: activation_to_ffi(inference.activation),
@@ -969,8 +1277,12 @@ fn model_info(
     })
 }
 
+fn shape_field(value: usize, name: &'static str) -> Result<u32, FfiError> {
+    u32::try_from(value).map_err(|_| FfiError::Model(format!("{name} does not fit u32")))
+}
+
 fn predict_payload(input: &GroupedTokens, weights: &Cb2VecWeights) -> Result<f32, FfiError> {
-    match &weights.payload {
+    match &*weights.payload {
         PackedQuantizedPayload::Flat(model) => {
             predict_quantized(input, model, weights.inference).map_err(map_training_error)
         }
@@ -995,7 +1307,7 @@ pub extern "C" fn cb2vec_library_version() -> *const c_char {
 /// Returns the current thread's last error. Copy it before the next ABI call.
 #[unsafe(no_mangle)]
 pub extern "C" fn cb2vec_last_error() -> *const c_char {
-    LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+    LAST_ERROR.with(|slot| slot.borrow().as_ptr().cast::<c_char>())
 }
 
 /// Writes the ABI-v1 default trainer configuration.
@@ -1402,10 +1714,12 @@ pub unsafe extern "C" fn cb2vec_trainer_quantize_v1(
             )
             .map_err(|error| FfiError::Model(error.to_string()))?;
         let weights = Cb2VecWeights {
-            payload: PackedQuantizedPayload::Flat(quantized),
+            payload: Arc::new(PackedQuantizedPayload::Flat(quantized)),
             inference: trainer.trainer.inference_config(),
             original_kind: CB2VEC_MODEL_KIND_FLAT,
             flags: 0,
+            artifact_version: u32::from(crate::CB2VEC_ARTIFACT_VERSION),
+            metadata: ArtifactMetadata::default(),
         };
         let handle = Box::into_raw(Box::new(weights));
         // SAFETY: Output storage was validated and initialized above.
@@ -1493,11 +1807,59 @@ pub unsafe extern "C" fn cb2vec_trainer_write_artifact_v1(
     })
 }
 
+/// Parses artifact bytes into an immutable model.
+///
+/// Version 2 artifacts answer the inference recipe from their own header; a
+/// `supplied` recipe is then a cross-check rather than the source of truth.
+/// Version 1 artifacts require one. Factored storage is reconstructed once
+/// into a flat table for runtime inference speed.
+fn load_model(
+    bytes: &[u8],
+    supplied: Option<InferenceConfig>,
+    expected_schema: Option<ArtifactMetadata>,
+) -> Result<Cb2VecWeights, FfiError> {
+    let artifact = PackedCodebookArtifact::parse(bytes)
+        .map_err(|error| FfiError::Artifact(error.to_string()))?;
+    let inference = artifact
+        .resolve_inference_config(supplied)
+        .map_err(|error| FfiError::Artifact(error.to_string()))?;
+    if let Some(expected) = expected_schema {
+        artifact
+            .verify_schema(expected)
+            .map_err(|error| FfiError::Artifact(error.to_string()))?;
+    }
+    let artifact_version = u32::from(artifact.format_version());
+    let metadata = artifact.metadata();
+    let mut flags = u32::from(artifact.used_legacy_magic()) * CB2VEC_MODEL_FLAG_LEGACY_MAGIC;
+    let original_kind = match artifact.kind() {
+        crate::PackedCodebookKind::Flat => CB2VEC_MODEL_KIND_FLAT,
+        crate::PackedCodebookKind::Factored => CB2VEC_MODEL_KIND_FACTORED,
+    };
+    let (_, payload) = artifact.into_parts();
+    let payload = match payload {
+        PackedQuantizedPayload::Flat(weights) => PackedQuantizedPayload::Flat(weights),
+        PackedQuantizedPayload::Factored(weights) => {
+            flags |= CB2VEC_MODEL_FLAG_FLATTENED_AT_LOAD;
+            PackedQuantizedPayload::Flat(weights.reconstruct_flat())
+        }
+    };
+    let model = Cb2VecWeights {
+        payload: Arc::new(payload),
+        inference,
+        original_kind,
+        flags,
+        artifact_version,
+        metadata,
+    };
+    quantized_info(&model)?;
+    Ok(model)
+}
+
 /// Loads an immutable quantized model from caller-owned artifact bytes.
 ///
-/// Factored storage is reconstructed once into a flat table for runtime
-/// inference speed. The artifact buffer may be released immediately after the
-/// call returns.
+/// The artifact buffer may be released immediately after the call returns.
+/// A version-2 artifact whose stored recipe disagrees with `inference` is
+/// rejected; use `cb2vec_model_load_v2` to let the artifact decide.
 ///
 /// # Safety
 ///
@@ -1520,31 +1882,125 @@ pub unsafe extern "C" fn cb2vec_model_load_v1(
         let bytes =
             // SAFETY: Caller keeps artifact storage live for this call.
             unsafe { raw_slice(artifact, artifact_len as usize, "artifact")? };
-        let artifact = PackedCodebookArtifact::parse(bytes)
-            .map_err(|error| FfiError::Artifact(error.to_string()))?;
-        let mut flags = u32::from(artifact.used_legacy_magic()) * CB2VEC_MODEL_FLAG_LEGACY_MAGIC;
-        let original_kind = match artifact.kind() {
-            crate::PackedCodebookKind::Flat => CB2VEC_MODEL_KIND_FLAT,
-            crate::PackedCodebookKind::Factored => CB2VEC_MODEL_KIND_FACTORED,
-        };
-        let (_, payload) = artifact.into_parts();
-        let payload = match payload {
-            PackedQuantizedPayload::Flat(weights) => PackedQuantizedPayload::Flat(weights),
-            PackedQuantizedPayload::Factored(weights) => {
-                flags |= CB2VEC_MODEL_FLAG_FLATTENED_AT_LOAD;
-                PackedQuantizedPayload::Flat(weights.reconstruct_flat())
-            }
-        };
-        let model = Cb2VecWeights {
-            payload,
-            inference,
-            original_kind,
-            flags,
-        };
-        quantized_info(&model)?;
-        let handle = Box::into_raw(Box::new(model));
+        let handle = Box::into_raw(Box::new(load_model(bytes, Some(inference), None)?));
         // SAFETY: Output storage was validated and initialized above.
         unsafe { ptr::write(out_model, handle) };
+        Ok(())
+    })
+}
+
+/// Loads a model, preferring the inference recipe stored in the artifact.
+///
+/// `inference` may be null. When it is not, a version-2 artifact whose stored
+/// recipe disagrees returns [`CB2VEC_ERROR_ARTIFACT`] instead of silently
+/// scoring with the wrong activation or pooling. A version-1 artifact still
+/// requires a non-null `inference`.
+///
+/// `expected_schema` may be null. When it is not, an artifact that carries a
+/// schema identity must match it exactly. Artifacts that carry none are
+/// accepted, so an unlabeled model can still be loaded deliberately.
+///
+/// # Safety
+///
+/// Artifact bytes must be readable for `artifact_len` bytes. Non-null
+/// `inference` and `expected_schema` must point to complete structs.
+/// `out_model` must be writable pointer storage and the returned handle must
+/// be freed exactly once with `cb2vec_model_free_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_model_load_v2(
+    artifact: *const u8,
+    artifact_len: u32,
+    inference: *const Cb2VecInferenceConfigV1,
+    expected_schema: *const Cb2VecArtifactMetadataV1,
+    out_model: *mut *mut Cb2VecWeights,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before parsing.
+        unsafe { write_out(out_model, ptr::null_mut(), "out_model")? };
+        let supplied = if inference.is_null() {
+            None
+        } else {
+            Some(decode_inference(
+                // SAFETY: A non-null pointer must reference one complete config.
+                unsafe { read_copy(inference, "inference")? },
+            )?)
+        };
+        let expected = if expected_schema.is_null() {
+            None
+        } else {
+            Some(decode_metadata(
+                // SAFETY: A non-null pointer must reference one complete struct.
+                unsafe { read_copy(expected_schema, "expected_schema")? },
+            )?)
+        };
+        let bytes =
+            // SAFETY: Caller keeps artifact storage live for this call.
+            unsafe { raw_slice(artifact, artifact_len as usize, "artifact")? };
+        let handle = Box::into_raw(Box::new(load_model(bytes, supplied, expected)?));
+        // SAFETY: Output storage was validated and initialized above.
+        unsafe { ptr::write(out_model, handle) };
+        Ok(())
+    })
+}
+
+/// Reads artifact metadata without building a model.
+///
+/// This is the cheap pre-flight check a consumer runs before committing to a
+/// download or a load: it reports the format version, shape, quantization
+/// scales, whether the file carries its own inference recipe, and the
+/// consumer-defined schema identity.
+///
+/// # Safety
+///
+/// Artifact bytes must be readable for `artifact_len` bytes and `out_info`
+/// writable for one complete [`Cb2VecArtifactInfoV1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_artifact_probe_v1(
+    artifact: *const u8,
+    artifact_len: u32,
+    out_info: *mut Cb2VecArtifactInfoV1,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before parsing.
+        unsafe { write_out(out_info, Cb2VecArtifactInfoV1::default(), "out_info")? };
+        let bytes =
+            // SAFETY: Caller keeps artifact storage live for this call.
+            unsafe { raw_slice(artifact, artifact_len as usize, "artifact")? };
+        let artifact = PackedCodebookArtifact::parse(bytes)
+            .map_err(|error| FfiError::Artifact(error.to_string()))?;
+        let (shape, embedding_scale, head_scale, factor_scale) =
+            payload_scales(artifact.quantized())?;
+        let metadata = artifact.metadata();
+        let info = Cb2VecArtifactInfoV1 {
+            artifact_version: u32::from(artifact.format_version()),
+            kind: match artifact.kind() {
+                crate::PackedCodebookKind::Flat => CB2VEC_MODEL_KIND_FLAT,
+                crate::PackedCodebookKind::Factored => CB2VEC_MODEL_KIND_FACTORED,
+            },
+            token_count: shape_field(shape.token_count(), "token_count")?,
+            group_count: shape_field(shape.group_count(), "group_count")?,
+            dim: shape_field(shape.dim(), "dim")?,
+            fm_rank: shape_field(shape.fm_rank(), "fm_rank")?,
+            has_inference_config: u32::from(artifact.inference_config().is_some()),
+            activation: artifact
+                .inference_config()
+                .map_or(CB2VEC_ACTIVATION_IDENTITY, |config| {
+                    activation_to_ffi(config.activation)
+                }),
+            pooling: artifact
+                .inference_config()
+                .map_or(CB2VEC_POOLING_SUM, |config| pooling_to_ffi(config.pooling)),
+            schema_version: metadata.schema_version,
+            embedding_scale,
+            head_scale,
+            factor_scale,
+            flags: u32::from(artifact.used_legacy_magic()) * CB2VEC_MODEL_FLAG_LEGACY_MAGIC,
+            source_sha256: *artifact.source_sha256(),
+            schema_digest: metadata.schema_digest,
+            ..Cb2VecArtifactInfoV1::default()
+        };
+        // SAFETY: Output storage was validated above.
+        unsafe { ptr::write(out_info, info) };
         Ok(())
     })
 }
@@ -1567,6 +2023,42 @@ pub unsafe extern "C" fn cb2vec_model_get_info_v1(
         let info = quantized_info(model)?;
         // SAFETY: Output storage was validated above.
         unsafe { ptr::write(out_info, info) };
+        Ok(())
+    })
+}
+
+/// Returns the schema identity the model's artifact carried.
+///
+/// A model loaded from a version-1 artifact, or from a version-2 artifact that
+/// recorded no schema, reports version zero and an all-zero digest.
+///
+/// # Safety
+///
+/// `model` must be live and `out_metadata` writable for one complete
+/// [`Cb2VecArtifactMetadataV1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_model_get_metadata_v1(
+    model: *const Cb2VecWeights,
+    out_metadata: *mut Cb2VecArtifactMetadataV1,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before handle validation.
+        unsafe {
+            write_out(
+                out_metadata,
+                Cb2VecArtifactMetadataV1::default(),
+                "out_metadata",
+            )?
+        };
+        // SAFETY: Caller guarantees a live immutable model.
+        let model = unsafe { weights_ref(model)? };
+        let metadata = Cb2VecArtifactMetadataV1 {
+            schema_version: model.metadata.schema_version,
+            schema_digest: model.metadata.schema_digest,
+            ..Cb2VecArtifactMetadataV1::default()
+        };
+        // SAFETY: Output storage was validated above.
+        unsafe { ptr::write(out_metadata, metadata) };
         Ok(())
     })
 }
@@ -1662,6 +2154,509 @@ pub unsafe extern "C" fn cb2vec_model_free_v1(model: *mut Cb2VecWeights) -> i32 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Incremental search sessions (ABI 1.1)
+// ---------------------------------------------------------------------------
+
+/// Writes the default session configuration.
+///
+/// # Safety
+///
+/// `out_config` must be aligned, writable storage for one complete
+/// [`Cb2VecSessionConfigV1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_config_default_v1(
+    out_config: *mut Cb2VecSessionConfigV1,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Required by this exported function's caller contract.
+        unsafe { write_out(out_config, Cb2VecSessionConfigV1::default(), "out_config") }
+    })
+}
+
+/// Creates an incremental search session over an immutable model.
+///
+/// Every buffer the search loop needs is allocated here, sized by `config`.
+/// The session takes shared ownership of the model's weights: freeing the
+/// model handle first is safe, and any number of sessions may share one model.
+/// A session itself is single-owner and must not be used from two threads.
+///
+/// The session is not scorable until `cb2vec_session_reset_v1` installs a
+/// position.
+///
+/// # Safety
+///
+/// `model` must be a live handle and `config` must point to one complete
+/// [`Cb2VecSessionConfigV1`]. `out_session` must be writable pointer storage,
+/// and the returned handle must be freed exactly once with
+/// `cb2vec_session_free_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_create_v1(
+    model: *const Cb2VecWeights,
+    config: *const Cb2VecSessionConfigV1,
+    out_session: *mut *mut Cb2VecSession,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before fallible work.
+        unsafe { write_out(out_session, ptr::null_mut(), "out_session")? };
+        let limits = decode_session_config(
+            // SAFETY: Caller supplies one complete config.
+            unsafe { read_copy(config, "config")? },
+        )?;
+        // SAFETY: Caller guarantees a live immutable model.
+        let model = unsafe { weights_ref(model)? };
+        let session = IncrementalSession::new(Arc::clone(&model.payload), model.inference, limits)
+            .map_err(map_session_error)?;
+        let handle = Box::into_raw(Box::new(Cb2VecSession { session }));
+        // SAFETY: Output storage was validated and initialized above.
+        unsafe { ptr::write(out_session, handle) };
+        Ok(())
+    })
+}
+
+/// Installs a complete position and discards every pushed frame.
+///
+/// The layout arguments are the same ragged token view every other CB2Vec
+/// entry point takes: `site_offsets` has `site_count + 1` monotonic entries
+/// starting at zero and ending at `tokens_len`, and `site_groups` holds one
+/// group index per site. Nothing changes unless every check passes.
+///
+/// This call allocates nothing; it only writes into buffers sized at creation.
+///
+/// # Safety
+///
+/// `session` must be a live handle owned exclusively by this thread. Every
+/// non-empty input buffer must remain readable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_reset_v1(
+    session: *mut Cb2VecSession,
+    tokens: *const u16,
+    tokens_len: u32,
+    site_offsets: *const u32,
+    site_groups: *const u32,
+    site_count: u32,
+) -> i32 {
+    ffi_guard(|| {
+        let tokens =
+            // SAFETY: Forwarded caller buffer; raw_slice performs structural checks.
+            unsafe { raw_slice(tokens, tokens_len as usize, "tokens")? };
+        let offset_count = (site_count as usize)
+            .checked_add(1)
+            .ok_or_else(|| FfiError::Invalid("site offset count overflow".to_string()))?;
+        let site_offsets =
+            // SAFETY: The prefix table has exactly site_count + 1 entries.
+            unsafe { raw_slice(site_offsets, offset_count, "site_offsets")? };
+        let site_groups =
+            // SAFETY: There is exactly one group index per site.
+            unsafe { raw_slice(site_groups, site_count as usize, "site_groups")? };
+        // SAFETY: Caller guarantees exclusive access to a live session.
+        let session = unsafe { session_mut(session)? };
+        session
+            .session
+            .reset(tokens, site_offsets, site_groups)
+            .map_err(map_session_error)
+    })
+}
+
+/// Pushes one search move's token replacements as a single reversible frame.
+///
+/// Each delta names a site, the lane within that site, the token it expects to
+/// find there, and its replacement. Every delta is validated before any state
+/// changes, so a rejected frame leaves the session exactly as it was and does
+/// not consume depth. A zero-length frame is legal and still pushes a frame,
+/// which keeps push/pop balanced for a null move.
+///
+/// Only the logical token state is updated here; numeric work is deferred to
+/// `cb2vec_session_materialize_v1` or `cb2vec_session_predict_v1`, so a branch
+/// that is pushed and popped without scoring costs nothing numerically.
+///
+/// # Safety
+///
+/// `session` must be a live handle owned exclusively by this thread. When
+/// `delta_count` is non-zero, `deltas` must be readable and 4-byte aligned for
+/// `delta_count` [`Cb2VecTokenDeltaV1`] values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_push_v1(
+    session: *mut Cb2VecSession,
+    deltas: *const Cb2VecTokenDeltaV1,
+    delta_count: u32,
+) -> i32 {
+    ffi_guard(|| {
+        // `Cb2VecTokenDeltaV1` and `SessionDelta` are asserted at compile time
+        // to have identical size, alignment, and field offsets, so the caller's
+        // array is borrowed directly. That is what keeps this call allocation
+        // free.
+        let deltas =
+            // SAFETY: Reading the layout-identical Rust type from a validated,
+            // caller-owned array of the same length; raw_slice checks null,
+            // alignment, and representable byte length.
+            unsafe { raw_slice(deltas.cast::<SessionDelta>(), delta_count as usize, "deltas")? };
+        // SAFETY: Caller guarantees exclusive access to a live session.
+        let session = unsafe { session_mut(session)? };
+        session.session.push(deltas).map_err(map_session_error)?;
+        Ok(())
+    })
+}
+
+/// Applies every pushed-but-unapplied frame to the numeric accumulators.
+///
+/// `cb2vec_session_predict_v1` does this implicitly; call this directly only
+/// to move the cost to a chosen point.
+///
+/// # Safety
+///
+/// `session` must be a live handle owned exclusively by this thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_materialize_v1(session: *mut Cb2VecSession) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Caller guarantees exclusive access to a live session.
+        let session = unsafe { session_mut(session)? };
+        session.session.materialize_pending();
+        Ok(())
+    })
+}
+
+/// Materializes pending frames and scores the current position.
+///
+/// The result is bit-identical to `cb2vec_model_predict_v1` on the same tokens
+/// with the same inference recipe.
+///
+/// # Safety
+///
+/// `session` must be a live handle owned exclusively by this thread, and
+/// `out_score` must be writable for one `float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_predict_v1(
+    session: *mut Cb2VecSession,
+    out_score: *mut f32,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Caller supplies one writable output scalar.
+        unsafe { write_out(out_score, 0.0, "out_score")? };
+        // SAFETY: Caller guarantees exclusive access to a live session.
+        let session = unsafe { session_mut(session)? };
+        let score = session.session.predict().map_err(map_session_error)?;
+        // SAFETY: Output storage was validated above.
+        unsafe { ptr::write(out_score, score) };
+        Ok(())
+    })
+}
+
+/// Undoes the most recent frame.
+///
+/// `out_popped_deltas` may be null. Popping with no frames left returns
+/// [`CB2VEC_ERROR_STATE`].
+///
+/// # Safety
+///
+/// `session` must be a live handle owned exclusively by this thread. A
+/// non-null `out_popped_deltas` must be writable for one `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_pop_v1(
+    session: *mut Cb2VecSession,
+    out_popped_deltas: *mut u32,
+) -> i32 {
+    ffi_guard(|| {
+        if !out_popped_deltas.is_null() {
+            // SAFETY: A non-null output is initialized before fallible work.
+            unsafe { write_out(out_popped_deltas, 0, "out_popped_deltas")? };
+        }
+        // SAFETY: Caller guarantees exclusive access to a live session.
+        let session = unsafe { session_mut(session)? };
+        let popped = session.session.pop().map_err(map_session_error)?;
+        if !out_popped_deltas.is_null() {
+            let popped = u32::try_from(popped)
+                .map_err(|_| FfiError::Invalid("frame size does not fit u32".to_string()))?;
+            // SAFETY: Output storage was validated above.
+            unsafe { ptr::write(out_popped_deltas, popped) };
+        }
+        Ok(())
+    })
+}
+
+/// Returns session shape, stack depth, and the capacities it was built with.
+///
+/// # Safety
+///
+/// `session` must be a live handle and `out_info` writable for one complete
+/// [`Cb2VecSessionInfoV1`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_get_info_v1(
+    session: *const Cb2VecSession,
+    out_info: *mut Cb2VecSessionInfoV1,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before handle validation.
+        unsafe { write_out(out_info, Cb2VecSessionInfoV1::default(), "out_info")? };
+        // SAFETY: Caller guarantees a live session handle.
+        let session = unsafe { session_ref(session)? };
+        let info = session.session.info();
+        let inference = session.session.inference_config();
+        let field = |value: usize, name: &'static str| {
+            u32::try_from(value).map_err(|_| FfiError::Model(format!("{name} does not fit u32")))
+        };
+        let info = Cb2VecSessionInfoV1 {
+            site_count: field(info.site_count, "site_count")?,
+            token_slots: field(info.token_slots, "token_slots")?,
+            group_count: field(info.group_count, "group_count")?,
+            depth: field(info.depth, "depth")?,
+            materialized_depth: field(info.materialized_depth, "materialized_depth")?,
+            pending_deltas: field(info.pending_deltas, "pending_deltas")?,
+            max_sites: field(info.limits.max_sites, "max_sites")?,
+            max_token_slots: field(info.limits.max_token_slots, "max_token_slots")?,
+            max_deltas_per_frame: field(info.limits.max_deltas_per_frame, "max_deltas_per_frame")?,
+            max_depth: field(info.limits.max_depth, "max_depth")?,
+            activation: activation_to_ffi(inference.activation),
+            pooling: pooling_to_ffi(inference.pooling),
+            ..Cb2VecSessionInfoV1::default()
+        };
+        // SAFETY: Output storage was validated above.
+        unsafe { ptr::write(out_info, info) };
+        Ok(())
+    })
+}
+
+/// Frees a session handle. A null handle is a successful no-op.
+///
+/// Freeing a session releases its share of the model's weights. The model
+/// handle and the session may be freed in either order.
+///
+/// # Safety
+///
+/// A non-null handle must have been returned by `cb2vec_session_create_v1`,
+/// must not have been freed, and must not be in use by another call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_session_free_v1(session: *mut Cb2VecSession) -> i32 {
+    ffi_guard(|| {
+        if !session.is_null() {
+            validate_mut_pointer(session, "session")?;
+            // SAFETY: The caller transfers the unique live Box allocation back
+            // exactly once, as required by this function's contract.
+            drop(unsafe { Box::from_raw(session) });
+        }
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Trainer checkpoints and artifact v2 (ABI 1.1)
+// ---------------------------------------------------------------------------
+
+/// Writes a complete trainer checkpoint into caller-owned storage.
+///
+/// Unlike an inference artifact, a checkpoint restores Adam moments, the
+/// optimizer step, the shuffle RNG, and completed epochs, so a resumed run is
+/// bit-identical to an uninterrupted one.
+///
+/// A null `out_bytes` with zero capacity is a size probe: the function writes
+/// the exact required byte count and returns [`CB2VEC_ERROR_BUFFER_TOO_SMALL`].
+/// No output bytes are written on a short buffer.
+///
+/// # Safety
+///
+/// `trainer` must be a live handle. `out_required_or_written` must be
+/// writable. A non-null output buffer must be writable for at least
+/// `out_capacity` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_trainer_write_checkpoint_v1(
+    trainer: *const Cb2VecTrainer,
+    out_bytes: *mut u8,
+    out_capacity: u32,
+    out_required_or_written: *mut u32,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize byte count before fallible work.
+        unsafe { write_out(out_required_or_written, 0, "out_required_or_written")? };
+        // SAFETY: Caller guarantees a live trainer.
+        let trainer = unsafe { trainer_ref(trainer)? };
+        let bytes = trainer
+            .trainer
+            .write_checkpoint()
+            .map_err(map_checkpoint_error)?;
+        let required = u32::try_from(bytes.len())
+            .map_err(|_| FfiError::Checkpoint("checkpoint exceeds u32 byte length".to_string()))?;
+        // SAFETY: Count output was validated above.
+        unsafe { ptr::write(out_required_or_written, required) };
+
+        if out_bytes.is_null() {
+            if out_capacity == 0 {
+                return Err(FfiError::BufferTooSmall {
+                    required: bytes.len(),
+                    capacity: 0,
+                });
+            }
+            return Err(FfiError::Null("out_bytes"));
+        }
+        if (out_capacity as usize) < bytes.len() {
+            return Err(FfiError::BufferTooSmall {
+                required: bytes.len(),
+                capacity: out_capacity as usize,
+            });
+        }
+        let output =
+            // SAFETY: Caller promised a writable buffer; only required bytes are used.
+            unsafe { raw_mut_slice(out_bytes, bytes.len(), "out_bytes")? };
+        output.copy_from_slice(&bytes);
+        Ok(())
+    })
+}
+
+/// Restores a trainer that continues exactly where the checkpoint stopped.
+///
+/// The trainer configuration comes from the checkpoint itself. Corrupt,
+/// truncated, or incompatible files are rejected with
+/// [`CB2VEC_ERROR_CHECKPOINT`] and no handle is produced.
+///
+/// # Safety
+///
+/// `checkpoint` must be readable for `checkpoint_len` bytes and `out_trainer`
+/// must be writable pointer storage. The returned handle must be freed exactly
+/// once with `cb2vec_trainer_free_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_trainer_load_checkpoint_v1(
+    checkpoint: *const u8,
+    checkpoint_len: u32,
+    out_trainer: *mut *mut Cb2VecTrainer,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize caller output before fallible parsing.
+        unsafe { write_out(out_trainer, ptr::null_mut(), "out_trainer")? };
+        let bytes =
+            // SAFETY: Caller keeps checkpoint storage alive for this call.
+            unsafe { raw_slice(checkpoint, checkpoint_len as usize, "checkpoint")? };
+        let trainer = Trainer::from_checkpoint(bytes).map_err(map_checkpoint_error)?;
+        let handle = Box::into_raw(Box::new(Cb2VecTrainer { trainer }));
+        // SAFETY: Output storage was validated and initialized above.
+        unsafe { ptr::write(out_trainer, handle) };
+        Ok(())
+    })
+}
+
+/// Exact byte length a checkpoint for this trainer will occupy.
+///
+/// # Safety
+///
+/// `trainer` must be a live handle and `out_len` writable for one `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_trainer_checkpoint_len_v1(
+    trainer: *const Cb2VecTrainer,
+    out_len: *mut u32,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize output before fallible work.
+        unsafe { write_out(out_len, 0, "out_len")? };
+        // SAFETY: Caller guarantees a live trainer.
+        let trainer = unsafe { trainer_ref(trainer)? };
+        let shape = trainer
+            .trainer
+            .weights()
+            .validate()
+            .map_err(|error| FfiError::Model(error.to_string()))?;
+        let len = TrainerCheckpoint::byte_len(shape).map_err(map_checkpoint_error)?;
+        let len = u32::try_from(len)
+            .map_err(|_| FfiError::Checkpoint("checkpoint exceeds u32 byte length".to_string()))?;
+        // SAFETY: Output storage was validated above.
+        unsafe { ptr::write(out_len, len) };
+        Ok(())
+    })
+}
+
+/// Writes a version-2 artifact that carries its own inference recipe.
+///
+/// The activation and pooling stored in the file come from the trainer, so a
+/// consumer loading it through `cb2vec_model_load_v2` cannot score with the
+/// wrong recipe. `metadata` may be null, in which case the artifact records no
+/// schema identity.
+///
+/// The buffer protocol matches `cb2vec_trainer_write_artifact_v1`: a null
+/// `out_bytes` with zero capacity is a size probe.
+///
+/// # Safety
+///
+/// The trainer and quantization config must be readable. `source_sha256_32`
+/// must point to 32 readable bytes. A non-null `metadata` must point to one
+/// complete struct. `out_required_or_written` must be writable, and a non-null
+/// output buffer must be writable for at least `out_capacity` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cb2vec_trainer_write_artifact_v2(
+    trainer: *const Cb2VecTrainer,
+    quantization: *const Cb2VecQuantizationConfigV1,
+    source_sha256_32: *const u8,
+    metadata: *const Cb2VecArtifactMetadataV1,
+    out_bytes: *mut u8,
+    out_capacity: u32,
+    out_required_or_written: *mut u32,
+) -> i32 {
+    ffi_guard(|| {
+        // SAFETY: Initialize byte count before fallible work.
+        unsafe { write_out(out_required_or_written, 0, "out_required_or_written")? };
+        let quantization = decode_quantization(
+            // SAFETY: Caller supplies one complete config.
+            unsafe { read_copy(quantization, "quantization")? },
+        )?;
+        let metadata = if metadata.is_null() {
+            ArtifactMetadata::default()
+        } else {
+            decode_metadata(
+                // SAFETY: A non-null pointer must reference one complete struct.
+                unsafe { read_copy(metadata, "metadata")? },
+            )?
+        };
+        let digest_bytes =
+            // SAFETY: The caller contract requires exactly 32 readable bytes.
+            unsafe { raw_slice(source_sha256_32, 32, "source_sha256_32")? };
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(digest_bytes);
+        // SAFETY: Caller guarantees a live trainer.
+        let trainer = unsafe { trainer_ref(trainer)? };
+        let quantized = trainer
+            .trainer
+            .weights()
+            .quantize_i16(
+                quantization.embedding_scale,
+                quantization.head_scale,
+                quantization.factor_scale,
+            )
+            .map_err(|error| FfiError::Model(error.to_string()))?;
+        let artifact = PackedCodebookArtifact::new_flat_v2(
+            trainer.trainer.weights().clone(),
+            quantized,
+            digest,
+            trainer.trainer.inference_config(),
+            metadata,
+        )
+        .map_err(|error| FfiError::Artifact(error.to_string()))?;
+        let bytes = artifact
+            .to_bytes()
+            .map_err(|error| FfiError::Artifact(error.to_string()))?;
+        let required = u32::try_from(bytes.len())
+            .map_err(|_| FfiError::Artifact("artifact exceeds u32 byte length".to_string()))?;
+        // SAFETY: Count output was validated above.
+        unsafe { ptr::write(out_required_or_written, required) };
+
+        if out_bytes.is_null() {
+            if out_capacity == 0 {
+                return Err(FfiError::BufferTooSmall {
+                    required: bytes.len(),
+                    capacity: 0,
+                });
+            }
+            return Err(FfiError::Null("out_bytes"));
+        }
+        if (out_capacity as usize) < bytes.len() {
+            return Err(FfiError::BufferTooSmall {
+                required: bytes.len(),
+                capacity: out_capacity as usize,
+            });
+        }
+        let output =
+            // SAFETY: Caller promised a writable buffer; only required bytes are used.
+            unsafe { raw_mut_slice(out_bytes, bytes.len(), "out_bytes")? };
+        output.copy_from_slice(&bytes);
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
@@ -1669,7 +2664,10 @@ mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::{CodebookWeights, FactoredQuantizedCodebookWeights, QuantizedCodebookWeights};
+    use crate::{
+        CB2VEC_CHECKPOINT_HEADER_LEN, CodebookWeights, FactoredQuantizedCodebookWeights,
+        QuantizedCodebookWeights,
+    };
 
     struct BatchFixture {
         tokens: Vec<u16>,
@@ -1807,10 +2805,86 @@ mod tests {
         assert_eq!(offset_of!(Cb2VecTrainingMetricsV1, total_weight), 16);
         assert_eq!(offset_of!(Cb2VecTrainingMetricsV1, sample_count), 24);
         assert_eq!(offset_of!(Cb2VecModelInfoV1, factor_scale), 52);
-        assert_eq!(cb2vec_abi_version(), 0x0001_0000);
+        assert_eq!(cb2vec_abi_version(), 0x0001_0001);
         // SAFETY: Version is a process-lifetime NUL-terminated static string.
         let version = unsafe { CStr::from_ptr(cb2vec_library_version()) };
         assert_eq!(version.to_bytes(), env!("CARGO_PKG_VERSION").as_bytes());
+
+        // Structures added in ABI 1.1.
+        assert_eq!(size_of::<Cb2VecSessionConfigV1>(), 32);
+        assert_eq!(size_of::<Cb2VecTokenDeltaV1>(), 12);
+        assert_eq!(size_of::<Cb2VecSessionInfoV1>(), 64);
+        assert_eq!(size_of::<Cb2VecArtifactMetadataV1>(), 32);
+        assert_eq!(size_of::<Cb2VecArtifactInfoV1>(), 112);
+        assert_eq!(offset_of!(Cb2VecTokenDeltaV1, old_token), 8);
+        assert_eq!(offset_of!(Cb2VecSessionInfoV1, max_sites), 32);
+        assert_eq!(offset_of!(Cb2VecArtifactMetadataV1, schema_digest), 16);
+        assert_eq!(offset_of!(Cb2VecArtifactInfoV1, source_sha256), 64);
+        assert_eq!(offset_of!(Cb2VecArtifactInfoV1, schema_digest), 96);
+
+        // The delta type crosses the ABI by reinterpretation, not conversion.
+        assert_eq!(size_of::<Cb2VecTokenDeltaV1>(), size_of::<SessionDelta>());
+        assert_eq!(align_of::<Cb2VecTokenDeltaV1>(), align_of::<SessionDelta>());
+        assert_eq!(
+            offset_of!(Cb2VecTokenDeltaV1, site),
+            offset_of!(SessionDelta, site)
+        );
+        assert_eq!(
+            offset_of!(Cb2VecTokenDeltaV1, new_token),
+            offset_of!(SessionDelta, new)
+        );
+    }
+
+    #[test]
+    fn abi_1_0_structs_are_still_accepted() {
+        // A consumer compiled against ABI 1.0 keeps working unchanged: it
+        // stamps 0x00010000 into every versioned struct it fills in itself.
+        let shape = Cb2VecModelShapeV1 {
+            abi_version: CB2VEC_ABI_VERSION_1_0,
+            token_count: 4,
+            group_count: 2,
+            dim: 3,
+            fm_rank: 1,
+            ..Cb2VecModelShapeV1::default()
+        };
+        let config = Cb2VecTrainerConfigV1 {
+            abi_version: CB2VEC_ABI_VERSION_1_0,
+            batch_size: 2,
+            shuffle: 0,
+            ..Cb2VecTrainerConfigV1::default()
+        };
+        let quantization = Cb2VecQuantizationConfigV1 {
+            abi_version: CB2VEC_ABI_VERSION_1_0,
+            ..Cb2VecQuantizationConfigV1::default()
+        };
+        assert!(decode_shape(shape).is_ok());
+        assert!(decode_config(config).is_ok());
+        assert!(decode_quantization(quantization).is_ok());
+
+        let trainer = create_trainer(&shape, &config);
+        let mut model = ptr::null_mut();
+        // SAFETY: Live trainer/config and writable handle output.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_quantize_v1(trainer, &quantization, &mut model),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+            assert_eq!(cb2vec_model_free_v1(model), CB2VEC_OK);
+            assert_eq!(cb2vec_trainer_free_v1(trainer), CB2VEC_OK);
+        }
+
+        // A future minor, and any other major, are rejected.
+        for rejected in [0x0001_0002u32, 0x0002_0000, 0x0000_0001] {
+            assert!(matches!(
+                decode_shape(Cb2VecModelShapeV1 {
+                    abi_version: rejected,
+                    ..shape
+                }),
+                Err(FfiError::Abi(_)),
+            ));
+        }
     }
 
     #[test]
@@ -2384,6 +3458,810 @@ mod tests {
 
         // SAFETY: Handle is uniquely freed once.
         unsafe { assert_eq!(cb2vec_trainer_free_v1(trainer), CB2VEC_OK) };
+    }
+
+    /// Builds a loaded model handle plus the ragged layout used by the
+    /// session tests below.
+    struct SessionFixture {
+        model: *mut Cb2VecWeights,
+        weights: QuantizedCodebookWeights,
+        tokens: Vec<u16>,
+        offsets: Vec<u32>,
+        groups: Vec<u32>,
+        inference: InferenceConfig,
+    }
+
+    impl SessionFixture {
+        fn new() -> Self {
+            let source = CodebookWeights::deterministic(9, 3, 4, 2);
+            let weights = source.quantize_i16_s32_s64();
+            let artifact = PackedCodebookArtifact::new_flat(source, weights.clone(), [0x33; 32])
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            let inference_ffi = Cb2VecInferenceConfigV1 {
+                activation: CB2VEC_ACTIVATION_RELU,
+                pooling: CB2VEC_POOLING_MEAN,
+                ..Cb2VecInferenceConfigV1::default()
+            };
+            let mut model = ptr::null_mut();
+            // SAFETY: Artifact/config are readable and handle output writable.
+            unsafe {
+                assert_eq!(
+                    cb2vec_model_load_v1(
+                        artifact.as_ptr(),
+                        artifact.len() as u32,
+                        &inference_ffi,
+                        &mut model,
+                    ),
+                    CB2VEC_OK,
+                    "{}",
+                    last_error_string()
+                );
+            }
+            Self {
+                model,
+                weights,
+                tokens: vec![0, 3, 5, 1, 8, 2, 7, 4, 6],
+                offsets: vec![0, 3, 5, 7, 8, 9],
+                groups: vec![0, 1, 1, 2, 0],
+                inference: InferenceConfig::new(Activation::Relu, Pooling::Mean),
+            }
+        }
+
+        fn create_session(&self, config: &Cb2VecSessionConfigV1) -> *mut Cb2VecSession {
+            let mut session = ptr::null_mut();
+            // SAFETY: Live model, complete config, writable handle output.
+            let status = unsafe { cb2vec_session_create_v1(self.model, config, &mut session) };
+            assert_eq!(status, CB2VEC_OK, "{}", last_error_string());
+            assert!(!session.is_null());
+            session
+        }
+
+        fn reset(&self, session: *mut Cb2VecSession) {
+            // SAFETY: Live session and complete live layout buffers.
+            let status = unsafe {
+                cb2vec_session_reset_v1(
+                    session,
+                    self.tokens.as_ptr(),
+                    self.tokens.len() as u32,
+                    self.offsets.as_ptr(),
+                    self.groups.as_ptr(),
+                    self.groups.len() as u32,
+                )
+            };
+            assert_eq!(status, CB2VEC_OK, "{}", last_error_string());
+        }
+
+        fn predict(&self, session: *mut Cb2VecSession) -> f32 {
+            let mut score = 0.0;
+            // SAFETY: Live session and writable output scalar.
+            let status = unsafe { cb2vec_session_predict_v1(session, &mut score) };
+            assert_eq!(status, CB2VEC_OK, "{}", last_error_string());
+            score
+        }
+
+        /// Full-rebuild reference score for an arbitrary token vector.
+        fn rebuild(&self, tokens: &[u16]) -> f32 {
+            let input = GroupedTokens::new(
+                tokens.to_vec(),
+                self.offsets.iter().map(|&value| value as usize).collect(),
+                self.groups.iter().map(|&value| value as usize).collect(),
+            )
+            .unwrap();
+            predict_quantized(&input, &self.weights, self.inference).unwrap()
+        }
+
+        /// The same score through the non-incremental C entry point.
+        fn rebuild_through_ffi(&self, tokens: &[u16]) -> f32 {
+            let mut score = 0.0;
+            // SAFETY: Live model and complete live input/output buffers.
+            let status = unsafe {
+                cb2vec_model_predict_v1(
+                    self.model,
+                    tokens.as_ptr(),
+                    tokens.len() as u32,
+                    self.offsets.as_ptr(),
+                    self.groups.as_ptr(),
+                    self.groups.len() as u32,
+                    &mut score,
+                )
+            };
+            assert_eq!(status, CB2VEC_OK, "{}", last_error_string());
+            score
+        }
+    }
+
+    impl Drop for SessionFixture {
+        fn drop(&mut self) {
+            // SAFETY: The handle is uniquely owned and freed exactly once.
+            unsafe { assert_eq!(cb2vec_model_free_v1(self.model), CB2VEC_OK) };
+        }
+    }
+
+    fn session_config() -> Cb2VecSessionConfigV1 {
+        Cb2VecSessionConfigV1 {
+            max_sites: 8,
+            max_token_slots: 16,
+            max_deltas_per_frame: 4,
+            max_depth: 6,
+            ..Cb2VecSessionConfigV1::default()
+        }
+    }
+
+    #[test]
+    fn session_defaults_create_reset_and_report_info() {
+        let mut config = Cb2VecSessionConfigV1 {
+            struct_size: 0,
+            abi_version: 0,
+            max_sites: 0,
+            max_token_slots: 0,
+            max_deltas_per_frame: 0,
+            max_depth: 0,
+            flags: 9,
+            reserved: [9; 1],
+        };
+        // SAFETY: Output is a complete writable stack value.
+        unsafe { assert_eq!(cb2vec_session_config_default_v1(&mut config), CB2VEC_OK) };
+        assert_eq!(config, Cb2VecSessionConfigV1::default());
+
+        let fixture = SessionFixture::new();
+        let config = session_config();
+        let session = fixture.create_session(&config);
+
+        let mut info = Cb2VecSessionInfoV1::default();
+        // SAFETY: Live session and writable info.
+        unsafe { assert_eq!(cb2vec_session_get_info_v1(session, &mut info), CB2VEC_OK) };
+        assert_eq!(info.site_count, 0);
+        assert_eq!(info.max_depth, config.max_depth);
+        assert_eq!(info.activation, CB2VEC_ACTIVATION_RELU);
+        assert_eq!(info.pooling, CB2VEC_POOLING_MEAN);
+
+        // Scoring before a reset is a state error, not a crash.
+        let mut score = 1.0;
+        // SAFETY: Live session and writable output.
+        let status = unsafe { cb2vec_session_predict_v1(session, &mut score) };
+        assert_eq!(status, CB2VEC_ERROR_STATE);
+        assert_eq!(score, 0.0);
+
+        fixture.reset(session);
+        // SAFETY: Live session and writable info.
+        unsafe { assert_eq!(cb2vec_session_get_info_v1(session, &mut info), CB2VEC_OK) };
+        assert_eq!(info.site_count, 5);
+        assert_eq!(info.token_slots, 9);
+        assert_eq!(info.group_count, 3);
+        assert_eq!(info.depth, 0);
+
+        // SAFETY: The handle is uniquely owned and freed exactly once; null is
+        // explicitly a successful no-op.
+        unsafe {
+            assert_eq!(cb2vec_session_free_v1(session), CB2VEC_OK);
+            assert_eq!(cb2vec_session_free_v1(ptr::null_mut()), CB2VEC_OK);
+        }
+    }
+
+    #[test]
+    fn session_scores_match_full_rebuild_through_the_abi() {
+        let fixture = SessionFixture::new();
+        let session = fixture.create_session(&session_config());
+        fixture.reset(session);
+
+        assert_eq!(
+            fixture.predict(session).to_bits(),
+            fixture.rebuild(&fixture.tokens).to_bits()
+        );
+        assert_eq!(
+            fixture.predict(session).to_bits(),
+            fixture.rebuild_through_ffi(&fixture.tokens).to_bits()
+        );
+
+        let frame = [
+            Cb2VecTokenDeltaV1 {
+                site: 0,
+                lane: 0,
+                old_token: 0,
+                new_token: 6,
+            },
+            Cb2VecTokenDeltaV1 {
+                site: 2,
+                lane: 1,
+                old_token: 7,
+                new_token: 0,
+            },
+        ];
+        // SAFETY: Live session and a complete live delta array.
+        unsafe {
+            assert_eq!(
+                cb2vec_session_push_v1(session, frame.as_ptr(), frame.len() as u32),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+        let expected = [6, 3, 5, 1, 8, 2, 0, 4, 6];
+        assert_eq!(
+            fixture.predict(session).to_bits(),
+            fixture.rebuild_through_ffi(&expected).to_bits()
+        );
+
+        // Explicit materialization is idempotent and does not shift the score.
+        // SAFETY: Live session handle.
+        unsafe {
+            assert_eq!(cb2vec_session_materialize_v1(session), CB2VEC_OK);
+            assert_eq!(cb2vec_session_materialize_v1(session), CB2VEC_OK);
+        }
+        assert_eq!(
+            fixture.predict(session).to_bits(),
+            fixture.rebuild_through_ffi(&expected).to_bits()
+        );
+
+        let mut popped = 0;
+        // SAFETY: Live session and writable count output.
+        unsafe {
+            assert_eq!(cb2vec_session_pop_v1(session, &mut popped), CB2VEC_OK);
+        }
+        assert_eq!(popped, 2);
+        assert_eq!(
+            fixture.predict(session).to_bits(),
+            fixture.rebuild_through_ffi(&fixture.tokens).to_bits()
+        );
+
+        // Popping an empty stack reports state, and a null count output is fine.
+        // SAFETY: Live session; a null count output is an explicit opt-out.
+        unsafe {
+            assert_eq!(
+                cb2vec_session_pop_v1(session, ptr::null_mut()),
+                CB2VEC_ERROR_STATE
+            );
+            assert_eq!(cb2vec_session_free_v1(session), CB2VEC_OK);
+        }
+    }
+
+    #[test]
+    fn session_rejects_bad_deltas_and_limits_without_corrupting_state() {
+        let fixture = SessionFixture::new();
+        let config = session_config();
+        let session = fixture.create_session(&config);
+        fixture.reset(session);
+        let before = fixture.predict(session).to_bits();
+
+        let push = |deltas: &[Cb2VecTokenDeltaV1]| {
+            // SAFETY: Live session and a complete live delta array.
+            unsafe { cb2vec_session_push_v1(session, deltas.as_ptr(), deltas.len() as u32) }
+        };
+        let delta = |site, lane, old_token, new_token| Cb2VecTokenDeltaV1 {
+            site,
+            lane,
+            old_token,
+            new_token,
+        };
+
+        // Wrong expected old token.
+        assert_eq!(push(&[delta(0, 0, 4, 1)]), CB2VEC_ERROR_INVALID_ARGUMENT);
+        // Site and lane out of range.
+        assert_eq!(push(&[delta(99, 0, 0, 1)]), CB2VEC_ERROR_INVALID_ARGUMENT);
+        assert_eq!(push(&[delta(3, 5, 4, 1)]), CB2VEC_ERROR_INVALID_ARGUMENT);
+        // Replacement token outside the codebook.
+        assert_eq!(push(&[delta(0, 0, 0, 500)]), CB2VEC_ERROR_INVALID_ARGUMENT);
+        // The same slot twice in one frame.
+        assert_eq!(
+            push(&[delta(0, 0, 0, 1), delta(0, 0, 0, 2)]),
+            CB2VEC_ERROR_INVALID_ARGUMENT
+        );
+        // A valid delta followed by an invalid one must not partially apply.
+        assert_eq!(
+            push(&[delta(1, 0, 1, 2), delta(1, 7, 0, 2)]),
+            CB2VEC_ERROR_INVALID_ARGUMENT
+        );
+
+        let mut info = Cb2VecSessionInfoV1::default();
+        // SAFETY: Live session and writable info.
+        unsafe { assert_eq!(cb2vec_session_get_info_v1(session, &mut info), CB2VEC_OK) };
+        assert_eq!(info.depth, 0);
+        assert_eq!(info.pending_deltas, 0);
+        assert_eq!(fixture.predict(session).to_bits(), before);
+
+        // Too many deltas in one frame.
+        let oversized: Vec<Cb2VecTokenDeltaV1> = (0..config.max_deltas_per_frame + 1)
+            .map(|lane| delta(0, lane % 3, 0, 1))
+            .collect();
+        // SAFETY: Live session and a complete live delta array.
+        let status =
+            unsafe { cb2vec_session_push_v1(session, oversized.as_ptr(), oversized.len() as u32) };
+        assert_eq!(status, CB2VEC_ERROR_LIMIT_EXCEEDED);
+
+        // Exhaust depth, then confirm the ceiling reports distinctly.
+        for step in 0..config.max_depth {
+            let old = if step == 0 { 0 } else { (step - 1) as u16 % 9 };
+            assert_eq!(push(&[delta(0, 0, old, (step % 9) as u16)]), CB2VEC_OK);
+        }
+        let last = (config.max_depth - 1) as u16 % 9;
+        assert_eq!(push(&[delta(0, 0, last, 1)]), CB2VEC_ERROR_LIMIT_EXCEEDED);
+
+        // Everything unwinds cleanly back to the reset position.
+        for _ in 0..config.max_depth {
+            // SAFETY: Live session; the count output is not needed here.
+            unsafe { assert_eq!(cb2vec_session_pop_v1(session, ptr::null_mut()), CB2VEC_OK) };
+        }
+        assert_eq!(fixture.predict(session).to_bits(), before);
+
+        // SAFETY: The handle is uniquely owned and freed exactly once.
+        unsafe { assert_eq!(cb2vec_session_free_v1(session), CB2VEC_OK) };
+    }
+
+    #[test]
+    fn sessions_share_a_model_and_outlive_its_handle() {
+        let source = CodebookWeights::deterministic(9, 3, 4, 2);
+        let weights = source.quantize_i16_s32_s64();
+        let artifact = PackedCodebookArtifact::new_flat(source, weights.clone(), [1; 32])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let inference_ffi = Cb2VecInferenceConfigV1 {
+            activation: CB2VEC_ACTIVATION_RELU,
+            pooling: CB2VEC_POOLING_MEAN,
+            ..Cb2VecInferenceConfigV1::default()
+        };
+        let mut model = ptr::null_mut();
+        // SAFETY: Artifact/config are readable and handle output writable.
+        unsafe {
+            assert_eq!(
+                cb2vec_model_load_v1(
+                    artifact.as_ptr(),
+                    artifact.len() as u32,
+                    &inference_ffi,
+                    &mut model,
+                ),
+                CB2VEC_OK
+            );
+        }
+
+        let tokens = [0u16, 3, 5, 1, 8, 2, 7, 4, 6];
+        let offsets = [0u32, 3, 5, 7, 8, 9];
+        let groups = [0u32, 1, 1, 2, 0];
+        let config = session_config();
+        let sessions: Vec<*mut Cb2VecSession> = (0..4)
+            .map(|index| {
+                let mut session = ptr::null_mut();
+                // SAFETY: Live model, complete config, writable output.
+                unsafe {
+                    assert_eq!(
+                        cb2vec_session_create_v1(model, &config, &mut session),
+                        CB2VEC_OK
+                    );
+                    assert_eq!(
+                        cb2vec_session_reset_v1(
+                            session,
+                            tokens.as_ptr(),
+                            tokens.len() as u32,
+                            offsets.as_ptr(),
+                            groups.as_ptr(),
+                            groups.len() as u32,
+                        ),
+                        CB2VEC_OK
+                    );
+                    let delta = Cb2VecTokenDeltaV1 {
+                        site: 0,
+                        lane: 0,
+                        old_token: 0,
+                        new_token: index as u16 + 1,
+                    };
+                    assert_eq!(cb2vec_session_push_v1(session, &delta, 1), CB2VEC_OK);
+                }
+                session
+            })
+            .collect();
+
+        // Free the model first: sessions hold a share of the weights, so this
+        // is defined behavior rather than a dangling reference.
+        // SAFETY: The model handle is uniquely owned and freed exactly once.
+        unsafe { assert_eq!(cb2vec_model_free_v1(model), CB2VEC_OK) };
+
+        let inference = InferenceConfig::new(Activation::Relu, Pooling::Mean);
+        for (index, &session) in sessions.iter().enumerate() {
+            let mut expected_tokens = tokens;
+            expected_tokens[0] = index as u16 + 1;
+            let expected = predict_quantized(
+                &GroupedTokens::new(
+                    expected_tokens.to_vec(),
+                    offsets.iter().map(|&value| value as usize).collect(),
+                    groups.iter().map(|&value| value as usize).collect(),
+                )
+                .unwrap(),
+                &weights,
+                inference,
+            )
+            .unwrap();
+            let mut score = 0.0;
+            // SAFETY: Every session handle is still live and exclusively used.
+            unsafe {
+                assert_eq!(cb2vec_session_predict_v1(session, &mut score), CB2VEC_OK);
+            }
+            assert_eq!(
+                score.to_bits(),
+                expected.to_bits(),
+                "session {index} observed another session's state"
+            );
+        }
+        for &session in &sessions {
+            // SAFETY: Each handle is uniquely owned and freed exactly once.
+            unsafe { assert_eq!(cb2vec_session_free_v1(session), CB2VEC_OK) };
+        }
+    }
+
+    #[test]
+    fn the_c_session_loop_does_not_allocate() {
+        let fixture = SessionFixture::new();
+        let session = fixture.create_session(&session_config());
+        fixture.reset(session);
+        let frame = [
+            Cb2VecTokenDeltaV1 {
+                site: 0,
+                lane: 0,
+                old_token: 0,
+                new_token: 4,
+            },
+            Cb2VecTokenDeltaV1 {
+                site: 2,
+                lane: 0,
+                old_token: 2,
+                new_token: 7,
+            },
+        ];
+        let mut score = 0.0;
+
+        // SAFETY: Live session and complete live delta/score storage. The warm
+        // up pass materializes anything lazily initialized on first use.
+        unsafe {
+            for _ in 0..4 {
+                assert_eq!(
+                    cb2vec_session_push_v1(session, frame.as_ptr(), 2),
+                    CB2VEC_OK
+                );
+                assert_eq!(cb2vec_session_predict_v1(session, &mut score), CB2VEC_OK);
+                assert_eq!(cb2vec_session_pop_v1(session, ptr::null_mut()), CB2VEC_OK);
+            }
+
+            let guard = crate::testing::AllocationGuard::new();
+            for _ in 0..1_000 {
+                assert_eq!(
+                    cb2vec_session_push_v1(session, frame.as_ptr(), 2),
+                    CB2VEC_OK
+                );
+                assert_eq!(cb2vec_session_predict_v1(session, &mut score), CB2VEC_OK);
+                assert_eq!(cb2vec_session_pop_v1(session, ptr::null_mut()), CB2VEC_OK);
+            }
+            guard.assert_no_allocations("C ABI session loop");
+            assert_eq!(cb2vec_session_free_v1(session), CB2VEC_OK);
+        }
+        assert!(score.is_finite());
+    }
+
+    #[test]
+    fn checkpoints_resume_training_exactly_through_the_abi() {
+        let (shape_ffi, _) = shape_fixture();
+        let (config_ffi, _) = config_fixture();
+        let fixture = BatchFixture::unequal_mean();
+        let batch = fixture.view();
+        let trainer = create_trainer(&shape_ffi, &config_ffi);
+        let mut metrics = Cb2VecTrainingMetricsV1::default();
+        // SAFETY: Live trainer, descriptor buffers, and output.
+        unsafe {
+            for _ in 0..3 {
+                assert_eq!(
+                    cb2vec_trainer_train_epoch_v1(trainer, &batch, &mut metrics),
+                    CB2VEC_OK
+                );
+            }
+        }
+
+        let mut declared = 0;
+        let mut required = 0;
+        // SAFETY: Live trainer and writable count outputs; null/zero is the
+        // defined size probe.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_checkpoint_len_v1(trainer, &mut declared),
+                CB2VEC_OK
+            );
+            assert_eq!(
+                cb2vec_trainer_write_checkpoint_v1(trainer, ptr::null_mut(), 0, &mut required),
+                CB2VEC_ERROR_BUFFER_TOO_SMALL
+            );
+        }
+        assert_eq!(declared, required);
+
+        let mut short = vec![0xCCu8; required as usize - 1];
+        let short_capacity = short.len() as u32;
+        // SAFETY: Short buffer is live; capacity is checked before writing.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_checkpoint_v1(
+                    trainer,
+                    short.as_mut_ptr(),
+                    short_capacity,
+                    &mut required,
+                ),
+                CB2VEC_ERROR_BUFFER_TOO_SMALL
+            );
+        }
+        assert!(short.iter().all(|&byte| byte == 0xCC));
+
+        let mut bytes = vec![0u8; required as usize];
+        // SAFETY: Output has exactly the required writable bytes.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_checkpoint_v1(
+                    trainer,
+                    bytes.as_mut_ptr(),
+                    required,
+                    &mut required,
+                ),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+
+        let mut resumed = ptr::null_mut();
+        // SAFETY: Checkpoint bytes are live and the handle output is writable.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_load_checkpoint_v1(bytes.as_ptr(), required, &mut resumed),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+
+        // Continue both and require identical reports every epoch.
+        // SAFETY: Both trainers are live and exclusively accessed.
+        unsafe {
+            for epoch in 0..4 {
+                let mut original = Cb2VecTrainingMetricsV1::default();
+                let mut restored = Cb2VecTrainingMetricsV1::default();
+                assert_eq!(
+                    cb2vec_trainer_train_epoch_v1(trainer, &batch, &mut original),
+                    CB2VEC_OK
+                );
+                assert_eq!(
+                    cb2vec_trainer_train_epoch_v1(resumed, &batch, &mut restored),
+                    CB2VEC_OK
+                );
+                assert_eq!(original, restored, "epoch {epoch} diverged after resume");
+            }
+        }
+
+        // Corruption is rejected without producing a handle.
+        let mut corrupted = bytes;
+        corrupted[CB2VEC_CHECKPOINT_HEADER_LEN + 8] ^= 0x40;
+        let mut rejected = ptr::null_mut();
+        // SAFETY: Bytes are live; the call must fail before constructing a handle.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_load_checkpoint_v1(
+                    corrupted.as_ptr(),
+                    corrupted.len() as u32,
+                    &mut rejected,
+                ),
+                CB2VEC_ERROR_CHECKPOINT
+            );
+        }
+        assert!(rejected.is_null());
+
+        // SAFETY: Each handle is uniquely owned and freed exactly once.
+        unsafe {
+            assert_eq!(cb2vec_trainer_free_v1(resumed), CB2VEC_OK);
+            assert_eq!(cb2vec_trainer_free_v1(trainer), CB2VEC_OK);
+        }
+    }
+
+    #[test]
+    fn artifact_v2_carries_its_inference_recipe_and_schema() {
+        let (shape_ffi, _) = shape_fixture();
+        let (config_ffi, _) = config_fixture();
+        let trainer = create_trainer(&shape_ffi, &config_ffi);
+        let quantization = Cb2VecQuantizationConfigV1::default();
+        let digest = [0x77u8; 32];
+        let metadata = Cb2VecArtifactMetadataV1 {
+            schema_version: 42,
+            schema_digest: [0xAB; 16],
+            ..Cb2VecArtifactMetadataV1::default()
+        };
+
+        let mut required = 0;
+        // SAFETY: Live inputs and writable count; null/zero is the size probe.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_artifact_v2(
+                    trainer,
+                    &quantization,
+                    digest.as_ptr(),
+                    &metadata,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                ),
+                CB2VEC_ERROR_BUFFER_TOO_SMALL
+            );
+        }
+        let mut bytes = vec![0u8; required as usize];
+        // SAFETY: Output has exactly the required writable bytes.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_artifact_v2(
+                    trainer,
+                    &quantization,
+                    digest.as_ptr(),
+                    &metadata,
+                    bytes.as_mut_ptr(),
+                    required,
+                    &mut required,
+                ),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+
+        let mut info = Cb2VecArtifactInfoV1::default();
+        // SAFETY: Artifact bytes are live and info output is writable.
+        unsafe {
+            assert_eq!(
+                cb2vec_artifact_probe_v1(bytes.as_ptr(), required, &mut info),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+        assert_eq!(info.artifact_version, 2);
+        assert_eq!(info.has_inference_config, 1);
+        assert_eq!(info.activation, config_ffi.activation);
+        assert_eq!(info.pooling, config_ffi.pooling);
+        assert_eq!(info.schema_version, 42);
+        assert_eq!(info.schema_digest, [0xAB; 16]);
+        assert_eq!(info.source_sha256, digest);
+        assert_eq!(info.token_count, shape_ffi.token_count);
+
+        // Loading with no explicit recipe uses the stored one.
+        let mut model = ptr::null_mut();
+        // SAFETY: Artifact bytes live; null recipe/schema are explicit opt-outs.
+        unsafe {
+            assert_eq!(
+                cb2vec_model_load_v2(
+                    bytes.as_ptr(),
+                    required,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut model,
+                ),
+                CB2VEC_OK,
+                "{}",
+                last_error_string()
+            );
+        }
+        let mut model_info = Cb2VecModelInfoV1::default();
+        let mut model_metadata = Cb2VecArtifactMetadataV1::default();
+        // SAFETY: Live model and writable outputs.
+        unsafe {
+            assert_eq!(cb2vec_model_get_info_v1(model, &mut model_info), CB2VEC_OK);
+            assert_eq!(
+                cb2vec_model_get_metadata_v1(model, &mut model_metadata),
+                CB2VEC_OK
+            );
+        }
+        assert_eq!(model_info.artifact_version, 2);
+        assert_eq!(model_info.activation, config_ffi.activation);
+        assert_eq!(model_info.pooling, config_ffi.pooling);
+        assert_eq!(model_metadata.schema_version, 42);
+
+        // A conflicting recipe is refused rather than silently overridden.
+        let wrong = Cb2VecInferenceConfigV1 {
+            activation: CB2VEC_ACTIVATION_IDENTITY,
+            pooling: CB2VEC_POOLING_SUM,
+            ..Cb2VecInferenceConfigV1::default()
+        };
+        let mut rejected = ptr::null_mut();
+        // SAFETY: Artifact and config are live; the load must fail closed.
+        unsafe {
+            assert_eq!(
+                cb2vec_model_load_v2(bytes.as_ptr(), required, &wrong, ptr::null(), &mut rejected,),
+                CB2VEC_ERROR_ARTIFACT
+            );
+            assert!(rejected.is_null());
+            // The v1 entry point applies the same check.
+            assert_eq!(
+                cb2vec_model_load_v1(bytes.as_ptr(), required, &wrong, &mut rejected),
+                CB2VEC_ERROR_ARTIFACT
+            );
+            assert!(rejected.is_null());
+        }
+
+        // A schema mismatch is refused too.
+        let other_schema = Cb2VecArtifactMetadataV1 {
+            schema_version: 43,
+            schema_digest: [0xAB; 16],
+            ..Cb2VecArtifactMetadataV1::default()
+        };
+        // SAFETY: All inputs are live; the load must fail closed.
+        unsafe {
+            assert_eq!(
+                cb2vec_model_load_v2(
+                    bytes.as_ptr(),
+                    required,
+                    ptr::null(),
+                    &other_schema,
+                    &mut rejected,
+                ),
+                CB2VEC_ERROR_ARTIFACT
+            );
+            assert!(rejected.is_null());
+            assert_eq!(
+                cb2vec_model_load_v2(
+                    bytes.as_ptr(),
+                    required,
+                    ptr::null(),
+                    &metadata,
+                    &mut rejected,
+                ),
+                CB2VEC_OK
+            );
+            assert_eq!(cb2vec_model_free_v1(rejected), CB2VEC_OK);
+        }
+
+        // A v1 artifact still probes cleanly and still needs a recipe.
+        let mut v1_required = 0;
+        // SAFETY: Live inputs and writable count; null/zero is the size probe.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_artifact_v1(
+                    trainer,
+                    &quantization,
+                    digest.as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                    &mut v1_required,
+                ),
+                CB2VEC_ERROR_BUFFER_TOO_SMALL
+            );
+        }
+        let mut v1_bytes = vec![0u8; v1_required as usize];
+        // SAFETY: Output has exactly the required writable bytes.
+        unsafe {
+            assert_eq!(
+                cb2vec_trainer_write_artifact_v1(
+                    trainer,
+                    &quantization,
+                    digest.as_ptr(),
+                    v1_bytes.as_mut_ptr(),
+                    v1_required,
+                    &mut v1_required,
+                ),
+                CB2VEC_OK
+            );
+            let mut v1_info = Cb2VecArtifactInfoV1::default();
+            assert_eq!(
+                cb2vec_artifact_probe_v1(v1_bytes.as_ptr(), v1_required, &mut v1_info),
+                CB2VEC_OK
+            );
+            assert_eq!(v1_info.artifact_version, 1);
+            assert_eq!(v1_info.has_inference_config, 0);
+            assert_eq!(v1_info.schema_version, 0);
+            // Without a recipe there is nothing to load with.
+            assert_eq!(
+                cb2vec_model_load_v2(
+                    v1_bytes.as_ptr(),
+                    v1_required,
+                    ptr::null(),
+                    ptr::null(),
+                    &mut rejected,
+                ),
+                CB2VEC_ERROR_ARTIFACT
+            );
+            assert!(rejected.is_null());
+            assert_eq!(cb2vec_model_free_v1(model), CB2VEC_OK);
+            assert_eq!(cb2vec_trainer_free_v1(trainer), CB2VEC_OK);
+        }
     }
 
     #[test]

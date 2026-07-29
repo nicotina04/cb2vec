@@ -157,7 +157,7 @@ Consumers that load only binary artifacts can avoid the JSON dependency:
 cb2vec = { version = "0.2", default-features = false }
 ```
 
-CB2Vec 0.2 requires Rust 1.88 or newer. Training and binary artifacts do not
+CB2Vec 0.3 requires Rust 1.88 or newer. Training and binary artifacts do not
 require an optional feature.
 
 ## Native library and Unity
@@ -190,16 +190,26 @@ The stable C ABI 1.0 is declared in
 - trainer logits and probabilities;
 - PTQ into an independent immutable inference handle;
 - caller-buffer artifact export and artifact reload;
-- single and batched quantized inference.
+- single and batched quantized inference;
+- incremental make/predict/undo search sessions;
+- allocation-free repeated inference through reusable pinned buffers;
+- trainer checkpoints and version-2 artifacts.
+
+No `unsafe` code and no `/unsafe` compiler switch is required on the C# side.
 
 The flattened batch format concatenates all samples' tokens and sites. It has
 one global token-offset prefix table and a second prefix table delimiting the
 sites owned by each sample. No per-sample pointer graph crosses P/Invoke.
 
-The three version numbers are deliberately independent: crate `0.2.2`,
-artifact format `1`, and C ABI `1.0` (`0x00010000`). Artifact v1 does not store
-activation/pooling, so native model loading also takes an explicit
-`Cb2VecInferenceConfigV1`.
+The three version numbers are deliberately independent: crate `0.3.0`,
+artifact format `1` and `2`, trainer checkpoint format `1`, and C ABI `1.1`
+(`0x00010001`). ABI 1.1 is strictly additive over 1.0: every 1.0 symbol and
+struct still works, so check the major version only.
+
+Artifact v1 does not store activation/pooling, so loading one takes an explicit
+`Cb2VecInferenceConfigV1`. Artifact v2 stores the recipe itself and is loaded
+with `cb2vec_model_load_v2`, which rejects a conflicting recipe instead of
+silently scoring with the wrong one.
 
 ### Windows, Linux, and macOS
 
@@ -210,16 +220,42 @@ the binary artifact and trainer:
 cargo build --release --no-default-features
 ```
 
-For a Windows Unity Editor, copy `cb2vec.dll` and
-`bindings/csharp/CB2VecNative.cs` into the project, for example:
+### Unity 6 plug-in package
+
+[`unity/Assets/Plugins`](unity/) is a ready-to-copy tree whose `.meta` files
+already enable exactly one platform per library, with the right CPU:
 
 ```text
-Assets/
-  Plugins/
-    x86_64/
-      cb2vec.dll
-    CB2VecNative.cs
+Assets/Plugins/
+  CB2VecNative.cs                       <- from bindings/csharp/
+  x86_64/cb2vec.dll                     Editor + Standalone Windows x86_64
+  Android/arm64-v8a/libcb2vec.so        Android only, CPU ARM64
+  Android/armeabi-v7a/libcb2vec.so      Android only, CPU ARMv7
+  Android/x86_64/libcb2vec.so           Android only, CPU X86_64
+  Editor/CB2VecPluginImportFixer.cs     validates and repairs on import
 ```
+
+Copy your built binaries next to their `.meta` files, verify, then copy the
+tree into the project:
+
+```sh
+python3 tools/verify_unity_plugins.py --require-binaries
+```
+
+That script checks the import settings, GUID uniqueness, each ELF's machine
+type against its ABI directory, and the full exported symbol list including
+every symbol frozen at ABI 1.0. It exists because of a real failure: an
+`arm64-v8a` library whose `.meta` said `CPU: ARMv7` with every platform
+enabled. Unity accepted it silently and the build shipped. CI now runs the
+script against the actual Android artifacts.
+
+The Editor script is the second line of defence. Unity's default guess for an
+unknown `.so` is "every platform, CPU ARMv7", so a binary copied in *without*
+its `.meta` would reproduce exactly that bug; the script corrects it on import
+and adds **Tools > CB2Vec > Validate / Fix Native Plugin Import Settings**.
+
+See [`unity/README.md`](unity/README.md) for the full install and verification
+procedure, including the Player settings and the on-device check.
 
 For Linux or macOS, copy `libcb2vec.so` or `libcb2vec.dylib` under
 `Assets/Plugins`, then select the matching Editor/Standalone OS and CPU in the
@@ -261,12 +297,14 @@ build/android/jniLibs/
   x86_64/libcb2vec.so
 ```
 
-Copy the required `.so` files anywhere under the Unity project's `Assets`
-folder (a conventional destination is
-`Assets/Plugins/Android/<abi>/libcb2vec.so`). In each file's Plugin Inspector,
-enable Android and select the CPU matching its ABI. `arm64-v8a` is the normal
-device build; `x86_64` is useful for an emulator, and `armeabi-v7a` is only
-needed when the project still supports 32-bit ARM.
+Copy each `.so` next to its `.meta` in [`unity/Assets/Plugins/Android`](unity/),
+which already selects Android-only with the matching CPU, then run the verifier
+above. `arm64-v8a` is the normal device build; `x86_64` is useful for an
+emulator, and `armeabi-v7a` is only needed when the project still supports
+32-bit ARM.
+
+`CARGO_NDK_PLATFORM = 23` produces libraries that run on API 23 and above, so
+it already covers a project whose Minimum API Level is 25.
 
 See the official
 [`cargo-ndk` build instructions](https://github.com/bbqsrc/cargo-ndk),
@@ -311,14 +349,149 @@ using (var trainer = Cb2VecTrainer.Create(shape, config))
 }
 ```
 
+A search loop with no managed allocation and no per-call pin:
+
+```csharp
+using var model = Cb2VecModel.Load(artifactBytes);   // v2 carries its recipe
+using var session = model.CreateSession(sessionConfig);
+using var frame = new Cb2VecPinnedBuffer<Cb2VecTokenDeltaV1>(8);
+
+session.Reset(initialInput);
+
+frame.Items[0] = new Cb2VecTokenDeltaV1(site, lane, oldToken, newToken);
+session.Push(frame, 1);
+float score = session.Predict();
+session.Pop();
+```
+
 Trainer handles are not internally synchronized; serialize every call that
 uses the same trainer. Quantized model handles are immutable and may serve
 concurrent prediction calls as long as they are not disposed concurrently.
-The binding never retains managed pointers after a native call.
+Sessions are single-owner: create one per search thread over one shared model.
+
+A session holds a reference to its model's weights, so disposing the model
+first is defined behavior, not a dangling pointer; handles may be disposed in
+any order. The binding never retains managed pointers after a native call
+except through the explicit `Cb2VecPinned*` types, which you dispose yourself.
 The crate's direct release build pins `panic = "unwind"` so Rust panics can be
 converted into an ABI status. A parent Cargo workspace can override dependency
 profiles; if it deliberately selects `panic = "abort"`, no native library can
 recover from a Rust panic.
+
+## Incremental search sessions
+
+Alpha-beta search evaluates enormously more positions than it keeps. A session
+makes the abandoned ones cheap: pushing a move records a reversible frame of
+token replacements and touches nothing numeric, and scoring updates only the
+sites that actually changed.
+
+```rust
+use cb2vec::{
+    Activation, InferenceConfig, IncrementalSession, Pooling, SessionDelta, SessionLimits,
+};
+
+// Capacities are chosen once. Nothing after this allocates.
+let limits = SessionLimits::new(
+    225,  // max sites        (a 15x15 board)
+    900,  // max token slots
+    8,    // max deltas in one frame
+    64,   // max search depth
+);
+let mut session = IncrementalSession::new(
+    &weights,
+    InferenceConfig::new(Activation::Relu, Pooling::Mean),
+    limits,
+)?;
+session.reset(&tokens, &site_offsets, &site_groups)?;
+
+// One node of search.
+session.push(&[SessionDelta::new(site, lane, old_token, new_token)])?;
+let score = session.predict()?;
+session.pop()?;
+```
+
+Guarantees:
+
+| Property | Guarantee |
+|---|---|
+| Exactness | `predict` is bit-identical to `predict_quantized` on the same tokens |
+| Allocation | zero heap allocation after `new`, including through the C ABI |
+| Atomicity | a rejected frame leaves the session unchanged and does not consume depth |
+| Reversibility | any push/pop sequence returns to the reset position exactly |
+| Sharing | one immutable model, any number of sessions |
+| Threading | a session is single-owner; use one per search thread |
+
+A frame is validated in full before anything mutates, so a wrong expected old
+token, an out-of-range site or lane, a duplicate slot in one frame, or an
+exceeded limit is reported without corrupting state. Limits are reported
+distinctly (`CB2VEC_ERROR_LIMIT_EXCEEDED`) so a search can back off rather than
+guess.
+
+Total token slots are capped at 65,535. Quantized embedding components are
+`i16`, so that bound keeps every integer accumulator inside `i32` without a
+checked add in the hot loop.
+
+`ReversibleTokenJournal` remains the uniform-lane journal for Rust callers
+whose sites all own the same number of tokens. `IncrementalSession` is the
+ragged, runtime-sized counterpart that also owns the evaluator state, and it is
+what the C ABI exposes.
+
+See `examples/search_session.rs`.
+
+## Resuming interrupted training
+
+An inference artifact is a deployment format: restoring one gives you the
+weights and deliberately restarts optimization. A checkpoint is the other half.
+
+```rust
+let bytes = trainer.write_checkpoint()?;         // CB2VECCK, CRC-32 protected
+let mut resumed = Trainer::from_checkpoint(&bytes)?;
+```
+
+A checkpoint stores FP32 weights, Adam first and second moments, both bias
+correction powers, the optimizer step, the shuffle RNG including its buffered
+normal, completed epochs, and the trainer config. A run split across process
+restarts therefore produces bit-identical weights to one that never stopped,
+including the per-epoch shuffle order.
+
+| | Inference artifact | Trainer checkpoint |
+|---|---|---|
+| Weights | yes | yes |
+| Quantized deployment copy | yes | no |
+| Adam moments and step | no | yes |
+| Shuffle RNG and epochs | no | yes |
+| Trainer config | no | yes |
+| Purpose | ship a model | resume a run |
+
+Corrupted, truncated, and incompatible files are rejected before a trainer
+exists. See `examples/resume_training.rs`.
+
+## Preserving the inference recipe
+
+Artifact v1 stores weights and quantization metadata but not activation or
+pooling, so a consumer that guesses wrong scores silently and incorrectly.
+
+Artifact **v2** closes that hole while leaving v1 untouched, byte for byte, in
+both directions:
+
+```text
+v2 header (128 bytes) = v1 header (96 bytes)
+                      + activation (u8) + pooling (u8) + flags (u16)
+                      + schema_version (u32)
+                      + schema_digest (16 bytes)
+                      + reserved (8 bytes)
+```
+
+`cb2vec_model_load_v2` loads using the stored recipe, and rejects a supplied
+recipe that disagrees rather than overriding it. `cb2vec_artifact_probe_v1`
+reads the version, shape, scales, recipe, and schema identity without building
+a model.
+
+`schema_version` and `schema_digest` are an extension point CB2Vec never
+interprets. Token vocabulary and per-game feature schema stay entirely in the
+consuming application; these two fields simply let it refuse a model whose
+vocabulary no longer matches its own code. Artifacts that record no schema are
+accepted, so an unlabeled model can still be loaded deliberately.
 
 ## Training model
 

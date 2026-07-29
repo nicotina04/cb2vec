@@ -1,6 +1,6 @@
 [package]
 name = "cb2vec"
-version = "0.2.2"
+version = "0.3.0"
 authors = ["nicotina04 <devherdson@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"
@@ -9,8 +9,8 @@ repository = "https://github.com/nicotina04/cb2vec"
 homepage = "https://github.com/nicotina04/cb2vec"
 documentation = "https://docs.rs/cb2vec"
 readme = "README.md"
-description = "Train, quantize, and incrementally deploy categorical codebook value models in pure Rust"
-keywords = ["embedding", "game-ai", "training", "quantization"]
+description = "Train, checkpoint, quantize, and incrementally evaluate categorical codebook value models in pure Rust"
+keywords = ["embedding", "game-ai", "training", "quantization", "search"]
 categories = ["algorithms", "game-development"]
 include = [
     "/src/**",
@@ -20,6 +20,8 @@ include = [
     "/bindings/csharp/*.csproj",
     "/bindings/csharp/smoke/*.cs",
     "/bindings/csharp/smoke/*.csproj",
+    "/unity/**",
+    "/tools/*.py",
     "/Cargo.toml",
     "/README.md",
     "/BENCHMARKS.md",

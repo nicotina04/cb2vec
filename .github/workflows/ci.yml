@@ -35,6 +35,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy, rustfmt
+      - name: Verify the checked-in Unity plug-in metadata
+        run: python3 tools/verify_unity_plugins.py
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo doc --locked --all-features --no-deps
@@ -43,6 +45,8 @@ jobs:
       - run: cargo run --locked --example flat_roundtrip
       - run: cargo run --locked --example reversible_journal
       - run: cargo run --locked --example train_value
+      - run: cargo run --locked --example search_session
+      - run: cargo run --locked --example resume_training
       - run: cargo package --locked
 
   msrv:
@@ -70,6 +74,16 @@ jobs:
             | awk '$3 ~ /^cb2vec_/ { print $3 }' \
             | sort > target/release/cb2vec.symbols
           diff -u include/cb2vec.symbols target/release/cb2vec.symbols
+      - name: Verify every ABI 1.0 symbol still exists
+        run: |
+          # A dropped 1.0 symbol breaks consumers that never recompiled.
+          missing=$(comm -23 include/cb2vec.symbols.abi10 target/release/cb2vec.symbols)
+          if [ -n "$missing" ]; then
+            echo "ABI 1.0 symbols missing from this build:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "all $(wc -l < include/cb2vec.symbols.abi10) ABI 1.0 symbols present"
       - name: Compile and run C11 smoke
         run: |
           cc -std=c11 -Wall -Wextra -Werror \
@@ -111,3 +125,30 @@ jobs:
       - run: test -s target/android/jniLibs/arm64-v8a/libcb2vec.so
       - run: test -s target/android/jniLibs/armeabi-v7a/libcb2vec.so
       - run: test -s target/android/jniLibs/x86_64/libcb2vec.so
+      - name: Stage the Unity plug-in tree with the real Android binaries
+        run: |
+          cp target/android/jniLibs/arm64-v8a/libcb2vec.so \
+            unity/Assets/Plugins/Android/arm64-v8a/
+          cp target/android/jniLibs/armeabi-v7a/libcb2vec.so \
+            unity/Assets/Plugins/Android/armeabi-v7a/
+          cp target/android/jniLibs/x86_64/libcb2vec.so \
+            unity/Assets/Plugins/Android/x86_64/
+      - name: Verify Unity import settings, ABI architectures, and exports
+        run: |
+          # Catches the packaging failure this tree exists to prevent: an
+          # arm64-v8a library labelled ARMv7, or an Android .so enabled for
+          # every platform. Also proves all three ABIs export the full C ABI.
+          python3 tools/verify_unity_plugins.py
+      - name: Verify each Android ABI's architecture and symbol set
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            echo "== $abi =="
+            file "target/android/jniLibs/$abi/libcb2vec.so"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb2vec-unity-plugins
+          path: |
+            unity/
+            include/cb2vec.h
+            bindings/csharp/CB2VecNative.cs

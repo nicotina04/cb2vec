@@ -2,3 +2,8 @@
 /target-ci-*/
 /bindings/**/bin/
 /bindings/**/obj/
+
+# Native libraries staged into the Unity plug-in tree. Only the .meta files,
+# the Editor script, and the README are checked in; binaries come from a build.
+/unity/Assets/Plugins/x86_64/*.dll
+/unity/Assets/Plugins/Android/*/*.so
