@@ -1,4 +1,4 @@
-// CB2Vec 0.3.0 / C ABI 1.1 Unity binding.
+// CB2Vec 0.3.1 / C ABI 1.1 Unity binding.
 //
 // Copy this file to Assets/CB2Vec/Runtime/ in the Unity project and place the
 // matching native library under Assets/CB2Vec/Plugins/ for the target

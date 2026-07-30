@@ -2,7 +2,11 @@
 
 All notable changes to CB2Vec are documented in this file.
 
-## Unreleased
+## 0.3.1 - 2026-07-30
+
+No Rust source changed in this release. The crate content did change, because
+`include` ships `/unity/**`: the published package carries the restructured
+Unity tree. A 0.3.0 consumer keeps the old `Assets/Plugins` layout.
 
 ### Unity package restructure
 

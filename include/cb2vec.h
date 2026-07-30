@@ -20,7 +20,7 @@ extern "C" {
  * CB2Vec C ABI 1.1
  *
  * Version axes are independent:
- *   - crate/library release: 0.3.0
+ *   - crate/library release: 0.3.1
  *   - binary artifact format: 1 and 2
  *   - trainer checkpoint format: 1
  *   - C ABI: 1.1 (0x00010001)

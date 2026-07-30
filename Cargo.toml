@@ -1,6 +1,6 @@
 [package]
 name = "cb2vec"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["nicotina04 <devherdson@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"

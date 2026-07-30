@@ -201,7 +201,7 @@ The flattened batch format concatenates all samples' tokens and sites. It has
 one global token-offset prefix table and a second prefix table delimiting the
 sites owned by each sample. No per-sample pointer graph crosses P/Invoke.
 
-The three version numbers are deliberately independent: crate `0.3.0`,
+The three version numbers are deliberately independent: crate `0.3.1`,
 artifact format `1` and `2`, trainer checkpoint format `1`, and C ABI `1.1`
 (`0x00010001`). ABI 1.1 is strictly additive over 1.0: every 1.0 symbol and
 struct still works, so check the major version only.
