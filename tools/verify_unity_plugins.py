@@ -193,9 +193,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--plugins",
-        default="unity/Assets/Plugins",
+        default="unity/Assets/CB2Vec/Plugins",
         type=Path,
-        help="Path to the Assets/Plugins directory to verify.",
+        help="Path to the CB2Vec/Plugins directory to verify.",
     )
     parser.add_argument(
         "--symbols",

@@ -1,37 +1,65 @@
 # CB2Vec Unity native plug-in package
 
-A ready-to-copy `Assets/Plugins` tree for Unity 6 LTS, with the
-`PluginImporter` settings already correct. Copy the built binaries in, copy the
-tree into your project, and Unity imports each library for exactly one
-platform.
+A ready-to-copy `Assets/CB2Vec` package for Unity 6 LTS, with the
+`PluginImporter` settings and assembly definitions already correct. Copy the
+built binaries in, copy the tree into your project, and Unity imports each
+library for exactly one platform.
 
 ## Layout
 
 ```text
-unity/Assets/Plugins/
-  CB2VecNative.cs                        <- copy from bindings/csharp/
-  CB2VecNative.cs.meta
-  x86_64/
-    cb2vec.dll                           <- copy from target/release/
-    cb2vec.dll.meta                      Editor + Standalone Windows x86_64
-  Android/
-    arm64-v8a/
-      libcb2vec.so                       <- primary Android target
-      libcb2vec.so.meta                  Android only, CPU ARM64
-    armeabi-v7a/
-      libcb2vec.so
-      libcb2vec.so.meta                  Android only, CPU ARMv7
-    x86_64/
-      libcb2vec.so                       <- emulator
-      libcb2vec.so.meta                  Android only, CPU X86_64
+unity/Assets/CB2Vec/
+  Runtime/
+    CB2VecNative.cs                      <- copy from bindings/csharp/
+    CB2VecNative.cs.meta
+    CB2Vec.Runtime.asmdef                assembly "CB2Vec.Runtime"
   Editor/
     CB2VecPluginImportFixer.cs           corrects settings on import
     CB2VecPluginImportFixer.cs.meta
+    CB2Vec.Editor.asmdef                 assembly "CB2Vec.Editor", Editor only
+  Tests/Editor/
+    CB2VecSmokeTests.cs                  create/train/save/load/session
+    CB2Vec.Tests.Editor.asmdef           assembly "CB2Vec.Tests.Editor"
+  Plugins/
+    x86_64/
+      cb2vec.dll                         <- copy from target/release/
+      cb2vec.dll.meta                    Editor + Standalone Windows x86_64
+    Android/
+      arm64-v8a/
+        libcb2vec.so                     <- primary Android target
+        libcb2vec.so.meta                Android only, CPU ARM64
+      armeabi-v7a/
+        libcb2vec.so
+        libcb2vec.so.meta                Android only, CPU ARMv7
+      x86_64/
+        libcb2vec.so                     <- emulator
+        libcb2vec.so.meta                Android only, CPU X86_64
 ```
 
-Only the `.meta` files, the C# binding, and the Editor script are checked in.
-The binaries come from your own build, so the tree cannot go stale against the
-crate version you are actually using.
+Only the `.meta` files, the `.asmdef` files, the Editor script, the tests, and
+this README are checked in. The binaries come from your own build and
+`CB2VecNative.cs` is copied from `bindings/csharp/`, so the tree cannot go
+stale against the crate version you are actually using.
+
+## Assemblies
+
+`CB2VecNative.cs` lives in its own assembly rather than in Unity's predefined
+`Assembly-CSharp`. This matters: **an `.asmdef` assembly cannot reference a
+predefined assembly.** With the binding in `Assembly-CSharp` (or, because
+`Assets/Plugins` is a special folder, `Assembly-CSharp-firstpass`), any of your
+own code inside an `.asmdef` — a `Training` or `AI` assembly, say — cannot see
+the `CB2Vec` types at all, no matter how complete the binding is.
+
+| Assembly | Platforms | References |
+|---|---|---|
+| `CB2Vec.Runtime` | all | none (`noEngineReferences`, so no `UnityEngine`) |
+| `CB2Vec.Editor` | Editor | none |
+| `CB2Vec.Tests.Editor` | Editor | `CB2Vec.Runtime`, the test runners |
+
+To use CB2Vec from your own `.asmdef`, add `CB2Vec.Runtime` to its
+**Assembly Definition References**. Code that is *not* in an `.asmdef` needs no
+setup: `CB2Vec.Runtime` is `autoReferenced`, so the predefined assemblies pick
+it up automatically.
 
 ## Install
 
@@ -65,11 +93,11 @@ crate version you are actually using.
 2. **Copy the binaries into this tree**, next to their `.meta` files:
 
    ```text
-   target/release/cb2vec.dll                      -> Assets/Plugins/x86_64/
-   build/android/jniLibs/arm64-v8a/libcb2vec.so   -> Assets/Plugins/Android/arm64-v8a/
-   build/android/jniLibs/armeabi-v7a/libcb2vec.so -> Assets/Plugins/Android/armeabi-v7a/
-   build/android/jniLibs/x86_64/libcb2vec.so      -> Assets/Plugins/Android/x86_64/
-   bindings/csharp/CB2VecNative.cs                -> Assets/Plugins/
+   target/release/cb2vec.dll                      -> Assets/CB2Vec/Plugins/x86_64/
+   build/android/jniLibs/arm64-v8a/libcb2vec.so   -> Assets/CB2Vec/Plugins/Android/arm64-v8a/
+   build/android/jniLibs/armeabi-v7a/libcb2vec.so -> Assets/CB2Vec/Plugins/Android/armeabi-v7a/
+   build/android/jniLibs/x86_64/libcb2vec.so      -> Assets/CB2Vec/Plugins/Android/x86_64/
+   bindings/csharp/CB2VecNative.cs                -> Assets/CB2Vec/Runtime/
    ```
 
 3. **Verify before importing.** This catches a mislabelled ABI without opening
@@ -79,8 +107,10 @@ crate version you are actually using.
    python3 tools/verify_unity_plugins.py --require-binaries
    ```
 
-4. **Copy `unity/Assets/Plugins` into your project's `Assets/` folder**, keeping
-   the `.meta` files. Unity picks up the settings as-is; no Inspector work.
+4. **Copy `unity/Assets/CB2Vec` into your project's `Assets/` folder**, keeping
+   the `.meta` files. Unity picks up the settings as-is; no Inspector work. The
+   package may sit anywhere under `Assets/` — the import rules are matched
+   against the `CB2Vec/Plugins/...` suffix, not an absolute path.
 
 ## Verify inside Unity
 
@@ -95,7 +125,25 @@ its `.meta` still ends up configured correctly. That matters because Unity's
 default guess for an unknown `.so` is "every platform, CPU ARMv7" — the exact
 misconfiguration that ships an ARM64 library labelled ARMv7.
 
-Then confirm the library actually loads:
+Then run the smoke tests: **Window > General > Test Runner > EditMode**, and
+run `CB2Vec.Tests.Editor`. Five tests cover the whole pipeline against the
+Editor plug-in — the native library loads with a matching ABI, training reduces
+loss, a version-2 artifact round-trips through `Cb2VecModel`, a session scores
+identically to a full evaluation and restores itself after push/pop, and a
+trainer checkpoint resumes to the same loss.
+
+A failure there is almost always an install problem rather than a model
+problem: a missing `cb2vec.dll`, a plug-in disabled for the Editor, or a
+binding built against a different ABI.
+
+The same batch run, headless:
+
+```powershell
+Unity.exe -batchmode -runTests -testPlatform EditMode `
+  -projectPath <project> -testResults <results.xml>
+```
+
+For a quick manual check instead, drop this on a scene object:
 
 ```csharp
 using UnityEngine;
@@ -164,3 +212,12 @@ alive on its own, so disposal order does not matter.
 - `panic = "unwind"` must stay set in the release profile so a Rust panic
   becomes an ABI status instead of aborting the player. A parent Cargo
   workspace that forces `panic = "abort"` removes that safety net.
+- `Assets/CB2Vec/Plugins` is an ordinary folder, not Unity's special
+  `Assets/Plugins`. Native libraries are recognised by their `PluginImporter`
+  settings, not by folder name, so nothing depends on that name. The special
+  folder is in fact the thing to avoid here: it compiles scripts into the
+  predefined `Assembly-CSharp-firstpass`, which no `.asmdef` can reference.
+- iOS is not shipped. The binding routes every `DllImport` through one
+  `private const string Library = "cb2vec"`, so adding it later means building
+  a `staticlib` on macOS and switching that constant to `__Internal` under
+  `#if UNITY_IOS` — no change to any call site.

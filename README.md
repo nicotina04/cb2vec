@@ -222,18 +222,28 @@ cargo build --release --no-default-features
 
 ### Unity 6 plug-in package
 
-[`unity/Assets/Plugins`](unity/) is a ready-to-copy tree whose `.meta` files
-already enable exactly one platform per library, with the right CPU:
+[`unity/Assets/CB2Vec`](unity/) is a ready-to-copy package whose `.meta` files
+already enable exactly one platform per library, with the right CPU, and whose
+`.asmdef` files put the binding in an assembly your own `.asmdef` can
+reference:
 
 ```text
-Assets/Plugins/
-  CB2VecNative.cs                       <- from bindings/csharp/
-  x86_64/cb2vec.dll                     Editor + Standalone Windows x86_64
-  Android/arm64-v8a/libcb2vec.so        Android only, CPU ARM64
-  Android/armeabi-v7a/libcb2vec.so      Android only, CPU ARMv7
-  Android/x86_64/libcb2vec.so           Android only, CPU X86_64
+Assets/CB2Vec/
+  Runtime/CB2VecNative.cs               <- from bindings/csharp/
+  Runtime/CB2Vec.Runtime.asmdef         assembly "CB2Vec.Runtime"
   Editor/CB2VecPluginImportFixer.cs     validates and repairs on import
+  Editor/CB2Vec.Editor.asmdef           Editor-only assembly
+  Tests/Editor/CB2VecSmokeTests.cs      create/train/save/load/session
+  Plugins/x86_64/cb2vec.dll             Editor + Standalone Windows x86_64
+  Plugins/Android/arm64-v8a/libcb2vec.so    Android only, CPU ARM64
+  Plugins/Android/armeabi-v7a/libcb2vec.so  Android only, CPU ARMv7
+  Plugins/Android/x86_64/libcb2vec.so       Android only, CPU X86_64
 ```
+
+The assembly split is not cosmetic. A Unity `.asmdef` assembly cannot
+reference a predefined assembly, so a binding left in `Assembly-CSharp` is
+invisible to any of your code that lives in an `.asmdef`. Add
+`CB2Vec.Runtime` to that assembly's references and it resolves.
 
 Copy your built binaries next to their `.meta` files, verify, then copy the
 tree into the project:
@@ -258,9 +268,9 @@ See [`unity/README.md`](unity/README.md) for the full install and verification
 procedure, including the Player settings and the on-device check.
 
 For Linux or macOS, copy `libcb2vec.so` or `libcb2vec.dylib` under
-`Assets/Plugins`, then select the matching Editor/Standalone OS and CPU in the
-Unity Plugin Inspector. The C# import name stays `cb2vec` on every platform;
-omit `lib` and the file extension.
+`Assets/CB2Vec/Plugins`, then select the matching Editor/Standalone OS and CPU
+in the Unity Plugin Inspector. The C# import name stays `cb2vec` on every
+platform; omit `lib` and the file extension.
 
 ### Android `.so`
 
@@ -297,8 +307,9 @@ build/android/jniLibs/
   x86_64/libcb2vec.so
 ```
 
-Copy each `.so` next to its `.meta` in [`unity/Assets/Plugins/Android`](unity/),
-which already selects Android-only with the matching CPU, then run the verifier
+Copy each `.so` next to its `.meta` in
+[`unity/Assets/CB2Vec/Plugins/Android`](unity/), which already selects
+Android-only with the matching CPU, then run the verifier
 above. `arm64-v8a` is the normal device build; `x86_64` is useful for an
 emulator, and `armeabi-v7a` is only needed when the project still supports
 32-bit ARM.

@@ -1,8 +1,9 @@
 // CB2Vec 0.3.0 / C ABI 1.1 Unity binding.
 //
-// Copy this file into the Unity project and place the matching native library
-// in Assets/Plugins for the target platform. See unity/README.md for a ready
-// made Assets/Plugins tree with correct PluginImporter settings.
+// Copy this file to Assets/CB2Vec/Runtime/ in the Unity project and place the
+// matching native library under Assets/CB2Vec/Plugins/ for the target
+// platform. See unity/README.md for a ready made Assets/CB2Vec tree with
+// correct PluginImporter settings and assembly definitions.
 //
 // Two API tiers:
 //

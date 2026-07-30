@@ -2,6 +2,27 @@
 
 All notable changes to CB2Vec are documented in this file.
 
+## Unreleased
+
+### Unity package restructure
+
+- Move the Unity tree from `unity/Assets/Plugins` to `unity/Assets/CB2Vec`,
+  split into `Runtime/`, `Editor/`, `Tests/`, and `Plugins/`. Existing `.meta`
+  GUIDs are carried over unchanged, so import settings survive the move.
+- Add `CB2Vec.Runtime`, `CB2Vec.Editor`, and `CB2Vec.Tests.Editor` assembly
+  definitions. This is the reason for the move: a Unity `.asmdef` assembly
+  cannot reference a predefined assembly, so a binding sitting in
+  `Assembly-CSharp` (or `Assembly-CSharp-firstpass`, which is what
+  `Assets/Plugins` compiles to) is unreachable from any consumer that uses
+  assembly definitions. `CB2Vec.Runtime` declares `noEngineReferences`; the
+  binding uses no `UnityEngine` type.
+- Add EditMode smoke tests covering the ABI handshake, training convergence,
+  version-2 artifact round-trip, session scoring against a full evaluation,
+  push/pop restoration, and checkpoint resume.
+- Anchor the Editor import rules at the `CB2Vec/Plugins/...` suffix, so the
+  package may be relocated anywhere under `Assets/` without matching an
+  unrelated library that happens to share a file name.
+
 ## 0.3.0 - 2026-07-30
 
 ### Incremental search sessions

@@ -3,7 +3,12 @@
 /bindings/**/bin/
 /bindings/**/obj/
 
-# Native libraries staged into the Unity plug-in tree. Only the .meta files,
-# the Editor script, and the README are checked in; binaries come from a build.
-/unity/Assets/Plugins/x86_64/*.dll
-/unity/Assets/Plugins/Android/*/*.so
+# Release staging: built binaries and the packaged release archive.
+/build/
+
+# Files staged into the Unity package from elsewhere in the repo. Only the
+# .meta files, the Editor script, the asmdefs, the tests, and the README are
+# checked in; binaries come from a build and the binding from bindings/csharp.
+/unity/Assets/CB2Vec/Plugins/x86_64/*.dll
+/unity/Assets/CB2Vec/Plugins/Android/*/*.so
+/unity/Assets/CB2Vec/Runtime/CB2VecNative.cs

@@ -25,6 +25,12 @@ namespace CB2Vec.EditorTools
     /// and CPU. Nothing else is inspected, so the mapping cannot drift from
     /// what the build actually produced.
     /// </para>
+    /// <para>
+    /// Each rule is matched as a path *suffix* anchored at the package root
+    /// (<c>CB2Vec/Plugins/...</c>), so the package works wherever it is
+    /// dropped inside <c>Assets</c> while still refusing to claim some other
+    /// library that merely shares a file name.
+    /// </para>
     /// </remarks>
     public sealed class CB2VecPluginImportFixer : AssetPostprocessor
     {
@@ -43,28 +49,28 @@ namespace CB2Vec.EditorTools
         {
             new PluginRule
             {
-                PathSuffix = "Plugins/Android/arm64-v8a/libcb2vec.so",
+                PathSuffix = "CB2Vec/Plugins/Android/arm64-v8a/libcb2vec.so",
                 Android = true,
                 AndroidCpu = "ARM64",
                 EditorAndWindows = false,
             },
             new PluginRule
             {
-                PathSuffix = "Plugins/Android/armeabi-v7a/libcb2vec.so",
+                PathSuffix = "CB2Vec/Plugins/Android/armeabi-v7a/libcb2vec.so",
                 Android = true,
                 AndroidCpu = "ARMv7",
                 EditorAndWindows = false,
             },
             new PluginRule
             {
-                PathSuffix = "Plugins/Android/x86_64/libcb2vec.so",
+                PathSuffix = "CB2Vec/Plugins/Android/x86_64/libcb2vec.so",
                 Android = true,
                 AndroidCpu = "X86_64",
                 EditorAndWindows = false,
             },
             new PluginRule
             {
-                PathSuffix = "Plugins/x86_64/cb2vec.dll",
+                PathSuffix = "CB2Vec/Plugins/x86_64/cb2vec.dll",
                 Android = false,
                 AndroidCpu = "AnyCPU",
                 EditorAndWindows = true,
@@ -109,7 +115,7 @@ namespace CB2Vec.EditorTools
                 string path = FindAsset(rule.PathSuffix);
                 if (path == null)
                 {
-                    problems.Add("missing: Assets/" + rule.PathSuffix);
+                    problems.Add("missing: no asset path ends with " + rule.PathSuffix);
                     continue;
                 }
 

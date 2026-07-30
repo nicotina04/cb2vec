@@ -125,14 +125,15 @@ jobs:
       - run: test -s target/android/jniLibs/arm64-v8a/libcb2vec.so
       - run: test -s target/android/jniLibs/armeabi-v7a/libcb2vec.so
       - run: test -s target/android/jniLibs/x86_64/libcb2vec.so
-      - name: Stage the Unity plug-in tree with the real Android binaries
+      - name: Stage the Unity package with the real Android binaries
         run: |
           cp target/android/jniLibs/arm64-v8a/libcb2vec.so \
-            unity/Assets/Plugins/Android/arm64-v8a/
+            unity/Assets/CB2Vec/Plugins/Android/arm64-v8a/
           cp target/android/jniLibs/armeabi-v7a/libcb2vec.so \
-            unity/Assets/Plugins/Android/armeabi-v7a/
+            unity/Assets/CB2Vec/Plugins/Android/armeabi-v7a/
           cp target/android/jniLibs/x86_64/libcb2vec.so \
-            unity/Assets/Plugins/Android/x86_64/
+            unity/Assets/CB2Vec/Plugins/Android/x86_64/
+          cp bindings/csharp/CB2VecNative.cs unity/Assets/CB2Vec/Runtime/
       - name: Verify Unity import settings, ABI architectures, and exports
         run: |
           # Catches the packaging failure this tree exists to prevent: an
