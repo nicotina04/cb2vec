@@ -20,7 +20,15 @@ include = [
     "/bindings/csharp/*.csproj",
     "/bindings/csharp/smoke/*.cs",
     "/bindings/csharp/smoke/*.csproj",
-    "/unity/**",
+    # Only the checked-in package sources. A plain "/unity/**" also sweeps up
+    # the native libraries and the binding copy staged into the tree by a
+    # build: `include` overrides .gitignore, so a publish from a working tree
+    # that had been staged for Unity would ship megabytes of binaries.
+    "/unity/README.md",
+    "/unity/Assets/**/*.meta",
+    "/unity/Assets/**/*.asmdef",
+    "/unity/Assets/CB2Vec/Editor/*.cs",
+    "/unity/Assets/CB2Vec/Tests/**/*.cs",
     "/tools/*.py",
     "/Cargo.toml",
     "/README.md",
